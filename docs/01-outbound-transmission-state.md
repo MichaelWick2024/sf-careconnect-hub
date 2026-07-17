@@ -3,7 +3,7 @@
 > **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
 > **Audience** Salesforce developers building or maintaining Care Connect outbound.
 > **Status** **Specification + object metadata only. No Apex exists yet.** This document is the approval gate for the callout code.
-> **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org and verified by `sf sobject describe` — **17/17 fields** present with the attributes below, and the picklist API-name behaviour proven by live insert tests. **No Apex in this org yet.**
+> **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`. **No Apex in this org yet.**
 > **Owner** Care Connect integration team.
 > **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Admin`.
 
@@ -28,12 +28,12 @@ and Provider, and `Target_System__c` keeps one object serving both.
 | Field | Type | Ext ID | Unique | Req | Purpose |
 |---|---|:--:|:--:|:--:|---|
 | `Referral__c` | Lookup(`Referral__c`) | | | ✅ | Source referral. **`deleteConstraint = Restrict`** |
-| `Target_System__c` | Picklist *restricted* | | | | API names `ATTORNEY`, `PROVIDER` (labels: Attorney, Provider) |
-| `Operation__c` | Picklist *restricted* | | | | API name `CREATE_REFERRAL` (label: Create Referral) |
-| `Transmission_Key__c` | Text(255) | ✅ | ✅ | | Prevents duplicate logical transmissions |
-| `Correlation_Id__c` | Text(36) | ✅ | ✅ | | v4 UUID, **one per transmission**, reused across every attempt |
-| `Status__c` | Picklist *restricted*, default `Pending` | | | | `Pending`, `Processing`, `Retry Scheduled`, `Succeeded`, `Failed` |
-| `Retry_Count__c` | Number(3,0) | | | | Retries performed (attempts = `Retry_Count + 1`) |
+| `Target_System__c` | Picklist *restricted* | | | ✅ | API names `ATTORNEY`, `PROVIDER` (labels: Attorney, Provider) |
+| `Operation__c` | Picklist *restricted* | | | ✅ | API name `CREATE_REFERRAL` (label: Create Referral) |
+| `Transmission_Key__c` | Text(255) | ✅ | ✅ | ✅ | Prevents duplicate logical transmissions |
+| `Correlation_Id__c` | Text(36) | ✅ | ✅ | ✅ | v4 UUID, **one per transmission**, reused across every attempt |
+| `Status__c` | Picklist *restricted*, default `Pending` | | | ✅ | `Pending`, `Processing`, `Retry Scheduled`, `Succeeded`, `Failed` |
+| `Retry_Count__c` | Number(3,0), default `0` | | | ✅ | Retries performed (attempts = `Retry_Count + 1`) |
 | `Next_Retry_At__c` | Date/Time | | | | When another attempt becomes eligible |
 | `Last_Attempt_At__c` | Date/Time | | | | Most recent attempted callout |
 | `Processing_Started_At__c` | Date/Time | | | | Detects abandoned claims |
@@ -47,6 +47,25 @@ and Provider, and `Target_System__c` keeps one object serving both.
 
 **Never on this object:** raw error messages, request payloads, responses. Attempts belong in
 `Integration_Log__c`, sanitized.
+
+### Identity fields are required at the database
+
+**A unique constraint does not imply presence.** Salesforce permits many rows holding NULL in a
+unique field, so uniqueness alone would still allow rows that identify no logical transmission at
+all — a null target, operation, key and correlation id, with `Status` merely defaulting to Pending.
+
+Every field that forms a transmission's identity is therefore `required` at the database, not only in
+prose. Verified in the org:
+
+```
+insert new Integration_Transmission__c(Referral__c = r.Id);   // everything else null
+-> REQUIRED_FIELD_MISSING: [Correlation_Id__c, Transmission_Key__c, Operation__c, Target_System__c...]
+
+insert (Status and Retry_Count omitted)
+-> Status__c = Pending    Retry_Count__c = 0     // defaults applied
+```
+
+This was enforced pre-production, while the object holds no data — the only cheap moment to do it.
 
 ### Lookup, not Master-Detail — and why the platform agreed
 
@@ -86,6 +105,30 @@ constraint between systems that have nothing to do with each other.
 
 `External_Record_Id__c` remains queryable for humans and reports; `External_Record_Key__c` carries
 the constraint.
+
+### The state machine is the only writer
+
+The invariants above (immutable correlation id, defined transitions only, tokens belonging to active
+attempts, Succeeded terminal) are worthless if a person can edit the fields by hand. Record-level
+access must not casually bypass them:
+
+| Control | Setting |
+|---|---|
+| Page layout | **Every field `Readonly`** — including universally required ones (Salesforce permits this; verified) |
+| `Integration_Admin` | **No longer covers this object at all** |
+| `Integration_Transmission_Support` | Read-only. For investigation. Cannot create, edit **or delete**. |
+| `Integration_Transmission_Runtime` | Create/read/edit for the execution path only. **No delete. No Modify All.** |
+
+**Delete is granted to nobody.** `Restrict` on the parent lookup stops a referral cascading its
+history away — that protection is void if a human can delete the child directly. The transmission
+*is* the operational history.
+
+**Manual retry is not field editing.** Transition #9 must be a controlled action performing the
+transition atomically. Editing `Status__c` by hand is not a supported path — and with the layout
+read-only and support access read-only, it is not an available one either.
+
+> A Setup administrator can always change metadata deliberately. That is a different threat from
+> ordinary record editing quietly corrupting state, which is what these controls close.
 
 ## Uniqueness — forever, never status-dependent
 
@@ -177,10 +220,11 @@ claim of a test-based control would be a promise, not a control.
 | 1 | *(none)* | Referral becomes eligible | **Pending** | `Correlation_Id = Uuid.v4()` **once**; `Transmission_Key = key`; `Retry_Count = 0` |
 | 2 | Pending | claimed | **Processing** | `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now`. **`Retry_Count` unchanged** — this is attempt 1, not a retry |
 | 3 | Retry Scheduled *(`Next_Retry_At <= now`)* | claimed | **Processing** | **`Retry_Count++`**; `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now` |
-| 4 | Processing | **valid** success response | **Succeeded** | `External_Record_Id`, **`External_Record_Key = <target code>\|<external id>`**, `External_Salesforce_Id`, `Last_Status_Code`, `Succeeded_At = now`; clear `Claim_Token`, `Next_Retry_At`, `Last_Error_Code` |
+| 4 | Processing | **valid** success response | **Succeeded** | `External_Record_Id`, **`External_Record_Key = <target code>\|<external id>`**, `External_Salesforce_Id`, `Last_Status_Code`, `Succeeded_At = now`; **clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`, `Last_Error_Code`** |
 | 5 | Processing | transient failure, `Retry_Count < MAX_RETRIES` | **Retry Scheduled** | `Last_Status_Code`, `Last_Error_Code`, `Next_Retry_At = backoff`; clear `Claim_Token`, `Processing_Started_At` |
-| 6 | Processing | transient failure, `Retry_Count >= MAX_RETRIES` | **Failed** | `Last_Status_Code`, `Last_Error_Code = RETRY_BUDGET_EXHAUSTED`; clear `Claim_Token` |
-| 7 | Processing | permanent failure | **Failed** | `Last_Status_Code`, `Last_Error_Code`; clear `Claim_Token` |
+| 6 | Processing | transient failure, `Retry_Count >= MAX_RETRIES` | **Failed** | `Last_Status_Code`, `Last_Error_Code = RETRY_BUDGET_EXHAUSTED`; **clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`** |
+| 7 | Processing | permanent failure | **Failed** | `Last_Status_Code`, `Last_Error_Code`; **clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`** |
+| 7b | Processing | **`External_Record_Key__c` collision** (`DUPLICATE_VALUE` on the unique key) | **Failed** | `Last_Error_Code = EXTERNAL_RECORD_CONFLICT`; **do NOT persist the conflicting external identifiers**; clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`. **Never retried.** |
 | 8 | Processing *(`Processing_Started_At < now - STALE_AFTER`, and `STALE_AFTER` > callout timeout)* | recovery sweep | **Retry Scheduled** | `Last_Error_Code = STALE_CLAIM_RECOVERED`; `Next_Retry_At = now`; clear `Claim_Token`, `Processing_Started_At` |
 | 9 | Failed | manual retry | **Retry Scheduled** | `Retry_Count = 0`; `Next_Retry_At = now`; clear `Last_Error_Code`. **`Correlation_Id` unchanged** |
 | 10 | Succeeded | — | *terminal* | No transition out. Ever. |
@@ -193,7 +237,7 @@ claim of a test-based control would be a promise, not a control.
 4. Only **Pending** or **Retry Scheduled** (and due) are claim-eligible.
 5. `Claim_Token__c` is non-null **only** while `Status = Processing`.
 6. `Retry_Count__c` increments **only** on transition #3.
-7. `Next_Retry_At__c` is meaningful **only** in Retry Scheduled.
+7. `Next_Retry_At__c` is meaningful **only** in Retry Scheduled — every terminal transition clears it, along with `Processing_Started_At__c` and `Claim_Token__c`. `Last_Attempt_At__c` is never cleared: it is the durable record of when the last attempt began.
 8. `External_Record_Id__c` / `External_Record_Key__c` are written **only** on transition #4, and only after validation.
 9. **Delivery is at-least-once.** Duplicate delivery is prevented by the receiver's idempotency, never by this object.
 
@@ -327,6 +371,39 @@ create a duplicate case. The retry budget bounds a persistently malformed contra
 > refuse untrusted input from Care Connect. A response is untrusted input too — including from a
 > system we wrote.
 
+### External record collision — a permanent condition, never a retry
+
+Transition #4 writes the unique `External_Record_Key__c`. If that write collides, the naive path is
+an **infinite loop**, not a transient failure:
+
+```
+Attorney returns success
+        ↓
+response passes validation
+        ↓
+External_Record_Key__c update violates uniqueness
+        ↓
+transaction rolls back  →  transmission stays Processing
+        ↓
+sweeper recovers it and re-sends
+        ↓
+same success, same DML failure, forever
+```
+
+Nothing about waiting fixes it. A collision means **two Care Connect transmissions claim the same
+target-system business record** — which means either remote idempotency is broken or our own keying
+is wrong. Both need a human.
+
+**Rule (transition #7b).** Catch the `DUPLICATE_VALUE` on `External_Record_Key__c` specifically.
+**Do not persist the conflicting external identifiers.** Move to **Failed** with
+`Last_Error_Code = EXTERNAL_RECORD_CONFLICT`, write one controlled log row, and **never enter the
+retry loop.** Classification is **permanent / requires investigation** — the one error code that
+means *stop and look*, not *try again*.
+
+Note this is the one place a `DUPLICATE_VALUE` must **not** be treated the way the claim path treats
+it. On the claim path a duplicate means "someone else won, resolve to their row" — a normal outcome.
+Here it means "two rows disagree about reality" — a defect. Same status code, opposite meaning.
+
 ## Failure classification
 
 `Last_Error_Code__c` holds a **controlled internal vocabulary only** — never a remote message, never
@@ -343,6 +420,7 @@ a platform exception message. An unrecognised condition maps to `UNKNOWN`.
 | `UNAUTHORIZED` | 401, 403 | **permanent** |
 | `NOT_FOUND` | 404 | **permanent** |
 | `CONFLICT` | 409 | **permanent** |
+| `EXTERNAL_RECORD_CONFLICT` | `External_Record_Key__c` collision on transition #4 | **permanent — requires investigation.** Never retried. |
 | `RETRY_BUDGET_EXHAUSTED` | transient failure with no budget left | **terminal** |
 | `STALE_CLAIM_RECOVERED` | recovery sweep | *(returns to Retry Scheduled)* |
 | `UNKNOWN` | anything unclassified | **transient** |
@@ -451,4 +529,9 @@ Connected App · `HttpCalloutMock` tests.
 | Transient vs permanent | 400 → Failed immediately; 500 → Retry Scheduled |
 | Duplicate transmission | Same (referral, target, operation) → `DUPLICATE_VALUE`, resolved to the existing row |
 | Bulk trigger | 200 referrals inserted → no `LimitException` |
-| Key stability | Renaming a picklist label fails the drift guard rather than corrupting the key |
+| **Label rename is harmless** | Renaming a picklist *label* leaves the API name present and the generated key **unchanged** — the test must **pass**, because this is supported behaviour, not a fault |
+| **API-name drift is caught** | Removing or changing a picklist *API name* **fails** the drift guard |
+| External record collision | A `DUPLICATE_VALUE` on `External_Record_Key__c` → Failed with `EXTERNAL_RECORD_CONFLICT`, identifiers not persisted, **no retry** |
+| Terminal cleanup | Succeeded and Failed both leave `Claim_Token`, `Processing_Started_At` and `Next_Retry_At` null; `Last_Attempt_At` survives |
+| Required identity fields | Inserting a transmission without target/operation/key/correlation id fails with `REQUIRED_FIELD_MISSING` |
+| No delete | Neither permission set can delete a transmission |

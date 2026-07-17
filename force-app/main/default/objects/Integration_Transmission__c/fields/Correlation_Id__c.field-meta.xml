@@ -4,7 +4,7 @@
     <externalId>true</externalId>
     <label>Correlation Id</label>
     <length>36</length>
-    <required>false</required>
+    <required>true</required>
     <type>Text</type>
     <unique>true</unique>
 </CustomField>

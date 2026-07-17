@@ -4,7 +4,7 @@
     <externalId>true</externalId>
     <label>Transmission Key</label>
     <length>255</length>
-    <required>false</required>
+    <required>true</required>
     <type>Text</type>
     <unique>true</unique>
 </CustomField>
