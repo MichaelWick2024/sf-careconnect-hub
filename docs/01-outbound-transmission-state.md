@@ -5,7 +5,7 @@
 > **Status** **Specification + object metadata only. No Apex exists yet.** This document is the approval gate for the callout code.
 > **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`. **No Apex in this org yet.**
 > **Owner** Care Connect integration team.
-> **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Admin`.
+> **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Transmission_Support` (read-only), `permissionsets/Integration_Transmission_Runtime` (execution path). `Integration_Admin` deliberately does **not** cover this object.
 
 ## Why this object exists
 
@@ -232,13 +232,14 @@ claim of a test-based control would be a promise, not a control.
 |---|---|---|---|---|
 | 1 | *(none)* | Referral becomes eligible | **Pending** | `Correlation_Id = Uuid.v4()` **once**; `Transmission_Key = key`; `Retry_Count = 0` |
 | 2 | Pending | claimed | **Processing** | `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now`. **`Retry_Count` unchanged** — this is attempt 1, not a retry |
-| 3 | Retry Scheduled *(`Next_Retry_At <= now`)* | claimed | **Processing** | **`Retry_Count++`**; `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now` |
+| 3 | Retry Scheduled *(`Next_Retry_At <= now` **and `Retry_Count < MAX_RETRIES`**)* | claimed | **Processing** | **`Retry_Count++`**; `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now` |
 | 4 | Processing | **valid** success response | **Succeeded** | `External_Record_Id`, **`External_Record_Key = <target code>\|<external id>`**, `External_Salesforce_Id`, `Last_Status_Code`, `Succeeded_At = now`; **clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`, `Last_Error_Code`** |
 | 5 | Processing | transient failure, `Retry_Count < MAX_RETRIES` | **Retry Scheduled** | `Last_Status_Code`, `Last_Error_Code`, `Next_Retry_At = backoff`; clear `Claim_Token`, `Processing_Started_At` |
 | 6 | Processing | transient failure, `Retry_Count >= MAX_RETRIES` | **Failed** | `Last_Status_Code`, `Last_Error_Code = RETRY_BUDGET_EXHAUSTED`; **clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`** |
 | 7 | Processing | permanent failure | **Failed** | `Last_Status_Code`, `Last_Error_Code`; **clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`** |
 | 7b | Processing | **`External_Record_Key__c` collision** (`DUPLICATE_VALUE` on the unique key) | **Failed** | `Last_Error_Code = EXTERNAL_RECORD_CONFLICT`; **do NOT persist the conflicting external identifiers**; clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`. **Never retried.** |
-| 8 | Processing *(`Processing_Started_At < now - STALE_AFTER`, and `STALE_AFTER` > callout timeout)* | recovery sweep | **Retry Scheduled** | `Last_Error_Code = STALE_CLAIM_RECOVERED`; `Next_Retry_At = now`; clear `Claim_Token`, `Processing_Started_At` |
+| 8a | Processing *(stale: `Processing_Started_At < now - STALE_AFTER`)* **and `Retry_Count < MAX_RETRIES`** | recovery sweep | **Retry Scheduled** | `Last_Error_Code = STALE_CLAIM_RECOVERED`; `Next_Retry_At = now`; clear `Claim_Token`, `Processing_Started_At` |
+| 8b | Processing *(stale)* **and `Retry_Count >= MAX_RETRIES`** | recovery sweep | **Failed** | `Last_Error_Code = RETRY_BUDGET_EXHAUSTED`; clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`. **Not returned to the loop.** |
 | 9 | Failed | manual retry | **Retry Scheduled** | `Retry_Count = 0`; `Next_Retry_At = now`; clear `Last_Error_Code`. **`Correlation_Id` unchanged** |
 | 10 | Succeeded | — | *terminal* | No transition out. Ever. |
 
@@ -260,7 +261,7 @@ claim of a test-based control would be a promise, not a control.
 
 With `MAX_RETRIES = 3`:
 
-| Attempt | Claimed from | `Retry_Count` during | Transient failure → |
+| Attempt | Claimed from | `Retry_Count` after claim | Transient failure → |
 |---|---|---|---|
 | 1 | Pending | 0 | `0 >= 3`? No → Retry Scheduled |
 | 2 | Retry Scheduled | 1 | `1 >= 3`? No → Retry Scheduled |
@@ -269,9 +270,31 @@ With `MAX_RETRIES = 3`:
 
 Total: 4 attempts = 1 initial + 3 retries.
 
-**A stale-recovered attempt is still counted**, because recovery (#8) returns to Retry Scheduled and
-the next claim (#3) increments. A job that dies every time is therefore still bounded — it cannot
-loop forever.
+### The budget must be *enforced* on the stale path, not merely counted
+
+**Counting an attempt is not the same as enforcing the ceiling.** This is the subtle failure. The
+transient-failure path (#5/#6) checks `Retry_Count` against `MAX_RETRIES`. A sender that *dies* never
+returns a classifiable failure — it goes stale and is recovered by the sweep. If recovery
+unconditionally returned the row to Retry Scheduled, a sender that dies every time would loop
+**forever**, incrementing but never failing:
+
+| Attempt | Claim | Outcome | If #8 has no budget check |
+|---|---|---|---|
+| 1 | count → 0 | sender **dies** | stale → Retry Scheduled |
+| 2 | count → 1 | sender **dies** | stale → Retry Scheduled |
+| 4 | count → 3 | sender **dies** | stale → Retry Scheduled → **attempt 5, 6, …** ✗ |
+
+So the ceiling is enforced in **both** places a row can leave Processing:
+
+- **Transient failure:** #5 (budget left) vs #6 (`RETRY_BUDGET_EXHAUSTED` → Failed).
+- **Stale recovery:** #8a (budget left) vs #8b (`RETRY_BUDGET_EXHAUSTED` → Failed).
+
+And the claim itself (#3) refuses a due row already at the ceiling (`Retry_Count < MAX_RETRIES`) — a
+defensive backstop so that even a row left in Retry Scheduled at the ceiling by some future bug
+cannot authorize another sender.
+
+With that, a sender that dies every time terminates at exactly **1 initial attempt + `MAX_RETRIES`
+retries → Failed**, whether the deaths are classifiable failures or stale-outs, or any mix.
 
 ## `Processing` cannot be the lock
 
@@ -291,8 +314,10 @@ if (transmission.Status__c == 'Pending') {   // two jobs can both read Pending
 
 1. `SELECT ... FROM Integration_Transmission__c WHERE Id = :id FOR UPDATE` — the row lock makes only
    one job capable of claiming.
-2. Verify `Status = Pending`, or `Status = Retry Scheduled AND Next_Retry_At <= now`. Otherwise
-   **exit silently** — someone else won, and that is a normal outcome, not an error.
+2. Verify `Status = Pending`, or `Status = Retry Scheduled AND Next_Retry_At <= now AND
+   Retry_Count < MAX_RETRIES`. Otherwise **exit silently** — someone else won, or the budget is
+   already spent; both are normal outcomes, not errors. (A due row at the ceiling is not claimed
+   here; the sweep's #8b path fails it instead.)
 3. `Status = Processing`; `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`;
    `Last_Attempt_At = now`; increment `Retry_Count` if claiming from Retry Scheduled.
 4. Enqueue the callout job with **transmission Id + claim token**.
@@ -501,16 +526,26 @@ The scheduled sweeper is the safety net and the uniform path for retries and sta
 A scheduled job — **not** a chained Queueable — drives:
 
 ```sql
-SELECT Id FROM Integration_Transmission__c
+SELECT Id, Status__c, Retry_Count__c FROM Integration_Transmission__c
 WHERE (Status__c = 'Pending')
    OR (Status__c = 'Retry Scheduled' AND Next_Retry_At__c <= :now)
    OR (Status__c = 'Processing'      AND Processing_Started_At__c < :staleCutoff)
 ```
 
+The sweep only *finds* candidates; the claim transaction (with `FOR UPDATE`) applies the precise
+rules. In particular, `Retry_Count__c` is selected so each candidate can be routed:
+
+- **Pending** → claim (#2).
+- **Retry Scheduled**, due → claim if `Retry_Count < MAX_RETRIES` (#3), else it is a budget-spent row
+  that should already be Failed; treat defensively.
+- **Processing**, stale → **#8a** if `Retry_Count < MAX_RETRIES`, else **#8b** (`Failed`,
+  `RETRY_BUDGET_EXHAUSTED`). **This budget check is what bounds a repeatedly-dying sender.**
+
 Scheduled Apex rather than chained Queueables because it (a) is not bound by the Queueable delay cap,
 so real exponential backoff is possible, and (b) reclaims stranded `Processing` rows. Chained
 Queueables can do neither — and a Queueable that dies from an uncatchable limit exception leaves a row
-stranded in `Processing` forever: never retried, never failed, invisible.
+stranded in `Processing`: without #8b it would be recovered forever; with #8b it fails after the
+budget is spent.
 
 ## Backoff
 
@@ -534,7 +569,9 @@ Connected App · `HttpCalloutMock` tests.
 |---|---|
 | Duplicate claim prevention | Two claims on one transmission → exactly one sends |
 | Stale claim token | A job with an outdated token exits without sending |
-| Stale processing recovery | `Processing` past the cutoff → Retry Scheduled, budget still bounded |
+| Stale processing recovery (budget left) | `Processing` past the cutoff with `Retry_Count < MAX` → Retry Scheduled (#8a) |
+| **Repeatedly-dying sender is bounded** | A sender that dies (goes stale) on **every** attempt produces **exactly 1 initial attempt + `MAX_RETRIES` retries**, ends in **Failed** (`RETRY_BUDGET_EXHAUSTED` via #8b), and **never authorizes another sender** afterward |
+| Ceiling row is never claimed | A due Retry Scheduled row at `Retry_Count = MAX_RETRIES` is not claimed by #3 |
 | Correlation reuse | Every attempt of one transmission shares one `Correlation_Id__c` |
 | Claim token rotation | Each attempt gets a **new** `Claim_Token__c` |
 | Response validation | Correlation mismatch / non-v4 id / `success:false` → `INVALID_RESPONSE`, nothing persisted |
