@@ -119,7 +119,7 @@ from the **stored value**, which is always the API name:
 
 ```apex
 key = referralId + '|' + t.Target_System__c + '|' + t.Operation__c;
-// -> a01g500000XSwviAAD|ATTORNEY|CREATE_REFERRAL
+// -> a01000000000001AAA|ATTORNEY|CREATE_REFERRAL
 ```
 
 **An admin may rename the label to `Attorney Firm`; the API name, the stored value and the key are
@@ -132,7 +132,7 @@ it adds a second place to drift.
 |---|---|
 | Insert with the **label** `'Create Referral'` (API name `CREATE_REFERRAL`) | **`INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST`** — the label is not a valid value |
 | Insert with lowercase `'attorney'` | Stored as **`ATTORNEY`** — matching is case-insensitive, storage is normalized to the API name |
-| Key built from the stored value | `a01g500000XSwviAAD\|ATTORNEY\|CREATE_REFERRAL` |
+| Key built from the stored value | `a01000000000001AAA\|ATTORNEY\|CREATE_REFERRAL` |
 
 > **Note:** a picklist value's `fullName` cannot be changed in place by a deploy — Salesforce adds a
 > new value and rejects the duplicate label. Changing an API name means dropping and recreating the
