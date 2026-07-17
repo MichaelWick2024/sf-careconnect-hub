@@ -130,6 +130,19 @@ read-only and support access read-only, it is not an available one either.
 > A Setup administrator can always change metadata deliberately. That is a different threat from
 > ordinary record editing quietly corrupting state, which is what these controls close.
 
+**Deployment consequence — do not skip this.** Because `Integration_Admin` no longer covers this
+object, one of the scoped permission sets **must** be assigned or the object is inaccessible:
+
+```bash
+sf org assign permset -n Integration_Transmission_Runtime -o careconnect   # execution path
+sf org assign permset -n Integration_Transmission_Support -o careconnect   # humans
+```
+
+The failure mode is deceptive: **without FLS, the Salesforce API reports a field as absent, not as
+forbidden.** After the split, `describe` showed only the 7 required fields (which need no FLS) and
+silently omitted the other 10 — they looked deleted. They were not. If a field "disappears", check
+permission-set assignment before you suspect the deploy.
+
 ## Uniqueness — forever, never status-dependent
 
 ```
