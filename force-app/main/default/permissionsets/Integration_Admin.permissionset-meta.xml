@@ -226,6 +226,11 @@
     </fieldPermissions>
     <fieldPermissions>
         <editable>true</editable>
+        <field>Integration_Transmission__c.External_Record_Key__c</field>
+        <readable>true</readable>
+    </fieldPermissions>
+    <fieldPermissions>
+        <editable>true</editable>
         <field>Integration_Transmission__c.External_Salesforce_Id__c</field>
         <readable>true</readable>
     </fieldPermissions>

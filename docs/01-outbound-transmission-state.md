@@ -3,7 +3,7 @@
 > **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
 > **Audience** Salesforce developers building or maintaining Care Connect outbound.
 > **Status** **Specification + object metadata only. No Apex exists yet.** This document is the approval gate for the callout code.
-> **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org and verified by `sf sobject describe` — 16/16 fields present with the attributes below. No Apex in this org yet.
+> **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org and verified by `sf sobject describe` — **17/17 fields** present with the attributes below, and the picklist API-name behaviour proven by live insert tests. **No Apex in this org yet.**
 > **Owner** Care Connect integration team.
 > **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Admin`.
 
@@ -28,8 +28,8 @@ and Provider, and `Target_System__c` keeps one object serving both.
 | Field | Type | Ext ID | Unique | Req | Purpose |
 |---|---|:--:|:--:|:--:|---|
 | `Referral__c` | Lookup(`Referral__c`) | | | ✅ | Source referral. **`deleteConstraint = Restrict`** |
-| `Target_System__c` | Picklist *restricted* | | | | `Attorney`, `Provider` |
-| `Operation__c` | Picklist *restricted* | | | | `Create Referral` |
+| `Target_System__c` | Picklist *restricted* | | | | API names `ATTORNEY`, `PROVIDER` (labels: Attorney, Provider) |
+| `Operation__c` | Picklist *restricted* | | | | API name `CREATE_REFERRAL` (label: Create Referral) |
 | `Transmission_Key__c` | Text(255) | ✅ | ✅ | | Prevents duplicate logical transmissions |
 | `Correlation_Id__c` | Text(36) | ✅ | ✅ | | v4 UUID, **one per transmission**, reused across every attempt |
 | `Status__c` | Picklist *restricted*, default `Pending` | | | | `Pending`, `Processing`, `Retry Scheduled`, `Succeeded`, `Failed` |
@@ -40,7 +40,8 @@ and Provider, and `Target_System__c` keeps one object serving both.
 | `Claim_Token__c` | Text(36) | | | | v4 UUID, **new per attempt** |
 | `Last_Status_Code__c` | Number(3,0) | | | | Most recent HTTP status |
 | `Last_Error_Code__c` | Text(80) | | | | **Controlled vocabulary only** |
-| `External_Record_Id__c` | Text(36) | ✅ | ✅ | | Attorney's durable UUID |
+| `External_Record_Id__c` | Text(36) | | | | The remote system's durable id (Attorney: a v4 UUID) |
+| `External_Record_Key__c` | Text(80) | ✅ | ✅ | | `TARGET_CODE\|EXTERNAL_RECORD_ID` — namespaced uniqueness |
 | `External_Salesforce_Id__c` | Text(18) | | | | Foreign org record Id — **diagnostics only** |
 | `Succeeded_At__c` | Date/Time | | | | Final successful completion |
 
@@ -63,10 +64,28 @@ for required lookup foreign key
 `Cascade` is ruled out by the very reason we avoided MD. So: **`Restrict`** — a referral with
 transmissions cannot be deleted. **You cannot accidentally erase the audit trail.**
 
-### `External_Record_Id__c` is Unique
+### External ids are namespaced, not globally unique
 
-Two transmissions holding the same Attorney case UUID would mean remote idempotency is broken. That
-should surface loudly at the database, not be discovered later.
+This object is deliberately generic across Attorney, Provider, and future systems. **An external id
+is only meaningful inside its target system's namespace** — two systems may legitimately issue the
+same identifier string, and a globally unique `External_Record_Id__c` would impose false uniqueness
+across unrelated systems.
+
+So uniqueness lives on a namespaced key:
+
+```
+External_Record_Key__c = <target code> | <external record id>
+
+ATTORNEY|550e8400-e29b-41d4-a716-446655440000
+PROVIDER|550e8400-e29b-41d4-a716-446655440000     ← legitimately coexists
+```
+
+That still prevents **one Attorney record being claimed by two transmissions** — which would mean
+remote idempotency is broken, and should surface loudly at the database — without inventing a
+constraint between systems that have nothing to do with each other.
+
+`External_Record_Id__c` remains queryable for humans and reports; `External_Record_Key__c` carries
+the constraint.
 
 ## Uniqueness — forever, never status-dependent
 
@@ -87,27 +106,49 @@ manual resubmissions **reuse that record and its correlation ID**. They never cr
 explicit `Source_Event_Id__c` or generation number to the key. Make it deliberate and visible —
 never a side effect of status.
 
-### The key uses stable codes, not picklist labels
+### The key is built directly from picklist API names
 
-The key is built from a **code**, not the picklist value:
+Picklist values carry a **label** and an **API name**, and they are independent. The key is built
+from the **stored value**, which is always the API name:
 
-| `Target_System__c` value | code |
+| Field | API name (stored, used in the key) | Label (display only) |
+|---|---|---|
+| `Target_System__c` | `ATTORNEY` | Attorney |
+| `Target_System__c` | `PROVIDER` | Provider |
+| `Operation__c` | `CREATE_REFERRAL` | Create Referral |
+
+```apex
+key = referralId + '|' + t.Target_System__c + '|' + t.Operation__c;
+// -> a01g500000XSwviAAD|ATTORNEY|CREATE_REFERRAL
+```
+
+**An admin may rename the label to `Attorney Firm`; the API name, the stored value and the key are
+unaffected.** No Apex mapping layer is needed — and an Apex value→code map would be *worse*, because
+it adds a second place to drift.
+
+**Verified against this org, not assumed:**
+
+| Test | Result |
 |---|---|
-| `Attorney` | `ATTORNEY` |
-| `Provider` | `PROVIDER` |
+| Insert with the **label** `'Create Referral'` (API name `CREATE_REFERRAL`) | **`INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST`** — the label is not a valid value |
+| Insert with lowercase `'attorney'` | Stored as **`ATTORNEY`** — matching is case-insensitive, storage is normalized to the API name |
+| Key built from the stored value | `a01g500000XSwviAAD\|ATTORNEY\|CREATE_REFERRAL` |
 
-| `Operation__c` value | code |
+> **Note:** a picklist value's `fullName` cannot be changed in place by a deploy — Salesforce adds a
+> new value and rejects the duplicate label. Changing an API name means dropping and recreating the
+> field, which is only safe before any data exists.
+
+**Controls — enforced now vs planned.** These are different things and the distinction matters:
+
+| Control | Status |
 |---|---|
-| `Create Referral` | `CREATE_REFERRAL` |
+| Uppercase, stable picklist **API names** in the metadata | ✅ **Enforced now** — deployed and verified |
+| `Transmission_Key__c` **Unique + External ID** at the database | ✅ **Enforced now** — deployed and verified |
+| **Protect picklist API names** from casual modification (org setting) | ⏳ **Planned** — not yet configured |
+| Test asserting the expected API names still exist | ⏳ **Planned** — no Apex in this org yet |
 
-**Why this matters.** If the key were derived from the label, an admin renaming `Attorney` →
-`Attorney Firm` would **silently change the key for every new row** while existing rows kept the old
-one — uniqueness would quietly stop working, and duplicates would appear with no error.
-
-**Protection.** An explicit Apex *value → code* map, plus a drift-guard test asserting every active
-picklist value has a code. A rename then **fails the build** instead of corrupting the key, and
-existing keys stay valid because the code is decoupled from the label. Same pattern as the Attorney
-org's `Case_Type__c` guard.
+Nothing in this repository *enforces* the planned rows today. This PR contains zero Apex, so any
+claim of a test-based control would be a promise, not a control.
 
 ## State machine
 
@@ -136,11 +177,11 @@ org's `Case_Type__c` guard.
 | 1 | *(none)* | Referral becomes eligible | **Pending** | `Correlation_Id = Uuid.v4()` **once**; `Transmission_Key = key`; `Retry_Count = 0` |
 | 2 | Pending | claimed | **Processing** | `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now`. **`Retry_Count` unchanged** — this is attempt 1, not a retry |
 | 3 | Retry Scheduled *(`Next_Retry_At <= now`)* | claimed | **Processing** | **`Retry_Count++`**; `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now` |
-| 4 | Processing | **valid** success response | **Succeeded** | `External_Record_Id`, `External_Salesforce_Id`, `Last_Status_Code`, `Succeeded_At = now`; clear `Claim_Token`, `Next_Retry_At`, `Last_Error_Code` |
+| 4 | Processing | **valid** success response | **Succeeded** | `External_Record_Id`, **`External_Record_Key = <target code>\|<external id>`**, `External_Salesforce_Id`, `Last_Status_Code`, `Succeeded_At = now`; clear `Claim_Token`, `Next_Retry_At`, `Last_Error_Code` |
 | 5 | Processing | transient failure, `Retry_Count < MAX_RETRIES` | **Retry Scheduled** | `Last_Status_Code`, `Last_Error_Code`, `Next_Retry_At = backoff`; clear `Claim_Token`, `Processing_Started_At` |
 | 6 | Processing | transient failure, `Retry_Count >= MAX_RETRIES` | **Failed** | `Last_Status_Code`, `Last_Error_Code = RETRY_BUDGET_EXHAUSTED`; clear `Claim_Token` |
 | 7 | Processing | permanent failure | **Failed** | `Last_Status_Code`, `Last_Error_Code`; clear `Claim_Token` |
-| 8 | Processing *(`Processing_Started_At < now - STALE_AFTER`)* | recovery sweep | **Retry Scheduled** | `Last_Error_Code = STALE_CLAIM_RECOVERED`; `Next_Retry_At = now`; clear `Claim_Token`, `Processing_Started_At` |
+| 8 | Processing *(`Processing_Started_At < now - STALE_AFTER`, and `STALE_AFTER` > callout timeout)* | recovery sweep | **Retry Scheduled** | `Last_Error_Code = STALE_CLAIM_RECOVERED`; `Next_Retry_At = now`; clear `Claim_Token`, `Processing_Started_At` |
 | 9 | Failed | manual retry | **Retry Scheduled** | `Retry_Count = 0`; `Next_Retry_At = now`; clear `Last_Error_Code`. **`Correlation_Id` unchanged** |
 | 10 | Succeeded | — | *terminal* | No transition out. Ever. |
 
@@ -153,7 +194,8 @@ org's `Case_Type__c` guard.
 5. `Claim_Token__c` is non-null **only** while `Status = Processing`.
 6. `Retry_Count__c` increments **only** on transition #3.
 7. `Next_Retry_At__c` is meaningful **only** in Retry Scheduled.
-8. `External_Record_Id__c` is written **only** on transition #4, and only after validation.
+8. `External_Record_Id__c` / `External_Record_Key__c` are written **only** on transition #4, and only after validation.
+9. **Delivery is at-least-once.** Duplicate delivery is prevented by the receiver's idempotency, never by this object.
 
 ### `Retry_Count__c` — exact semantics
 
@@ -212,6 +254,40 @@ if (transmission.Status__c == 'Pending') {   // two jobs can both read Pending
 
 This also satisfies the platform rule that a callout cannot follow DML in the same transaction: T1
 does the DML, T2 does SOQL → callout → DML.
+
+### Delivery guarantee: at-least-once, not exactly-once
+
+**This is the most important limitation in this document.**
+
+The claim token protects **local state authority**. It cannot guarantee exactly-once **remote
+delivery**, because it cannot retract an HTTP request that has already left:
+
+```
+Sender A            claims, sends request ──────────────────────►  Attorney
+                              │ (still in flight)
+Recovery sweep      declares the claim stale
+Sender B            re-claims, sends request ──────────────────►  Attorney
+                                                                   ↑
+                                              BOTH requests arrive
+```
+
+Sender A's now-stale token stops it **overwriting Care Connect state** when it finally returns. It
+does **not** un-send its request.
+
+> **Normative statement.** Delivery is **at-least-once**. Claim tokens prevent stale *state updates*;
+> the **Attorney API's idempotency** (keyed on the Care Connect referral Id) is what prevents
+> duplicate *business records*. There is no mechanism here that makes delivery exactly-once, and none
+> is planned — the correct place for that guarantee is the receiver, and it already exists there.
+
+**Consequences that must not be forgotten:**
+
+- Every operation Care Connect sends **must** be idempotent at the receiver. `Create Referral` is.
+  A future non-idempotent operation cannot use this design as-is.
+- `STALE_AFTER` **must exceed the callout timeout** (a Salesforce callout may run up to 120s). A
+  shorter window would manufacture the overlap above on healthy traffic rather than only on genuinely
+  dead jobs. Recommend ≥ 15 minutes.
+- Duplicate delivery is **expected and safe**, not an incident. Two Attorney log rows with one
+  correlation id are normal.
 
 ### The three identifiers, and why each exists
 
@@ -278,15 +354,56 @@ precisely because Attorney inbound is idempotent.
 `Last_Error_Code__c` is `Text(80)` rather than a restricted picklist on purpose: an unclassified
 condition must degrade to `UNKNOWN`, not fail the DML that is trying to record a failure.
 
-## Bulk: the trigger must not enqueue per referral
+## Async topology — normative
 
-`System.enqueueJob` is capped at **50 per transaction**. A trigger enqueuing one claim job per
-referral throws `LimitException` on a 200-record insert — **and the referral insert itself fails.**
-The integration would take the business process down with it.
+Two separate platform limits constrain this, and **both** must be respected:
 
-**Rule: the trigger enqueues at most ONE dispatcher per transaction.** The dispatcher claims a
-bounded batch and chains. The scheduled sweeper (below) is the safety net and the uniform path for
-retries.
+| Limit | Value | Breaks |
+|---|---|---|
+| `System.enqueueJob` per **synchronous** transaction | **50** | A trigger enqueuing one job per referral → `LimitException` on a 200-record insert, **and the referral insert itself fails** |
+| `System.enqueueJob` per **asynchronous** transaction (chaining) | **1** | A dispatcher fanning out one sender per transmission → fails on the second enqueue |
+
+The second limit is the one that bites: solving the trigger problem with "one dispatcher that fans
+out" **does not work**, because an executing Queueable may enqueue only **one** child. The topology
+must be a **serial chain**, not a fan-out.
+
+```
+Trigger transaction  (synchronous)
+    │  enqueue ONCE  — guarded by a transaction-level static
+    ▼
+Dispatcher / claimant  (async)
+    │  FOR UPDATE a bounded group; claim rows; assign a token to each
+    │  enqueue EXACTLY ONE job
+    ▼
+Sender  (async)
+    │  ALL callouts first  ──► then persist results + logs
+    │  enqueue ONE next dispatcher when work remains
+    ▼
+Dispatcher / claimant  …
+```
+
+### Normative rules
+
+1. **The trigger enqueues at most one dispatcher per transaction**, guarded by a **transaction-level
+   static boolean**. A trigger can fire several times in one transaction (multiple DML statements,
+   workflow field updates); without the guard, each firing enqueues another dispatcher.
+
+2. **A dispatcher enqueues exactly one sender.** Never one per transmission.
+
+3. **A sender performs every callout before any DML.** A callout may not follow DML in the same
+   transaction, so a batched sender cannot call out → save → call out again. Either:
+   - **(a)** perform all callouts for the claimed group, holding results in memory, then persist once
+     — bounded by the 100-callout limit (use ~50 for headroom); or
+   - **(b)** process exactly one transmission per sender transaction.
+
+   **(a)** is more efficient; **(b)** has a smaller blast radius if the transaction dies after the
+   callouts but before the DML. Under (a) that strands the whole claimed group in `Processing`, and
+   every one of them has *already been delivered* — recovery will re-send them all. Attorney's
+   idempotency absorbs it (see *Delivery guarantee*), but the tradeoff should be a deliberate choice.
+
+4. **A sender enqueues at most one next dispatcher**, only when work remains — this is the chain.
+
+The scheduled sweeper is the safety net and the uniform path for retries and stale recovery.
 
 ## Recovery sweep
 

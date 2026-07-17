@@ -3,7 +3,7 @@
 > **Purpose** Index for this repository's documentation.
 > **Audience** Salesforce developers and admins.
 > **Status** Phase 4 in progress — outbound transmission state specified, no Apex yet.
-> **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org, 16/16 fields verified. No Apex in this org.
+> **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org, 17/17 fields verified. No Apex in this org.
 > **Owner** Care Connect integration team.
 
 Care Connect is the **hub** of a three-org referral integration. Attorney and Provider never

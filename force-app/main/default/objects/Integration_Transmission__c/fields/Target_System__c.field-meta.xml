@@ -9,12 +9,12 @@
         <valueSetDefinition>
             <sorted>false</sorted>
             <value>
-                <fullName>Attorney</fullName>
+                <fullName>ATTORNEY</fullName>
                 <default>false</default>
                 <label>Attorney</label>
             </value>
             <value>
-                <fullName>Provider</fullName>
+                <fullName>PROVIDER</fullName>
                 <default>false</default>
                 <label>Provider</label>
             </value>
