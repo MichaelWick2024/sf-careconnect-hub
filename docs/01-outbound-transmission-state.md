@@ -212,15 +212,17 @@ claim of a test-based control would be a promise, not a control.
       Pending
          │ claim
          ▼
-    Processing ──── valid successful response ────► Succeeded (terminal)
+    Processing ──── valid successful response ────────► Succeeded (terminal)
          │
-         ├──────── transient failure (budget left) ─► Retry Scheduled
-         ├──────── transient failure (budget gone) ─► Failed
-         ├──────── permanent failure ───────────────► Failed
+         ├──────── transient failure (budget left) ───► Retry Scheduled   (#5)
+         ├──────── transient failure (budget gone) ───► Failed            (#6)
+         ├──────── permanent failure ─────────────────► Failed            (#7)
+         ├──────── external-record conflict ──────────► Failed            (#7b)
          │
-         └──────── abandoned/stale claim ──────────► Retry Scheduled
+         ├──────── stale claim (budget left) ─────────► Retry Scheduled   (#8a)
+         └──────── stale claim (budget gone) ─────────► Failed            (#8b)
 
-  Retry Scheduled ── due time reached and claimed ─► Processing
+  Retry Scheduled ── due AND budget left, claimed ──► Processing          (#3)
 
   Failed ────────── manual retry ───────────────────► Retry Scheduled
                                           (same Correlation_Id__c)
