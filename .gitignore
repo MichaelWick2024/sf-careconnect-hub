@@ -43,3 +43,14 @@ $RECYCLE.BIN/
 **/__pycache__/
 **/.venv/
 **/venv/
+
+# Credentials and key material — never commit (Phase 4 Connected App / JWT flow)
+*.key
+*.pem
+*.p12
+*.jks
+*.crt
+*.cer
+server.key
+**/authFiles/
+*.sfdx-auth-url
