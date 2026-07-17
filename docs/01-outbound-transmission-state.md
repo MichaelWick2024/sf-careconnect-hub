@@ -1,0 +1,337 @@
+# Outbound Transmission State — Specification
+
+> **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
+> **Audience** Salesforce developers building or maintaining Care Connect outbound.
+> **Status** **Specification + object metadata only. No Apex exists yet.** This document is the approval gate for the callout code.
+> **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org and verified by `sf sobject describe` — 16/16 fields present with the attributes below. No Apex in this org yet.
+> **Owner** Care Connect integration team.
+> **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Admin`.
+
+## Why this object exists
+
+`Integration_Log__c` records **individual attempts**. It must **never** be the source of truth for
+whether a referral still needs sending — deriving "outstanding work" from a log means reconstructing
+state from history, which is fragile and unqueryable.
+
+| Question | Answered by |
+|---|---|
+| *Does this referral still need sending to Attorney?* | **`Integration_Transmission__c`** (one row, current state) |
+| *What happened on attempt 3?* | `Integration_Log__c` (one row per attempt) |
+
+Attorney-specific fields on `Referral__c` were rejected: Care Connect will send to **both** Attorney
+and Provider, and `Target_System__c` keeps one object serving both.
+
+## Object
+
+`Integration_Transmission__c` · Name: Auto Number `TRN-{00000}`
+
+| Field | Type | Ext ID | Unique | Req | Purpose |
+|---|---|:--:|:--:|:--:|---|
+| `Referral__c` | Lookup(`Referral__c`) | | | ✅ | Source referral. **`deleteConstraint = Restrict`** |
+| `Target_System__c` | Picklist *restricted* | | | | `Attorney`, `Provider` |
+| `Operation__c` | Picklist *restricted* | | | | `Create Referral` |
+| `Transmission_Key__c` | Text(255) | ✅ | ✅ | | Prevents duplicate logical transmissions |
+| `Correlation_Id__c` | Text(36) | ✅ | ✅ | | v4 UUID, **one per transmission**, reused across every attempt |
+| `Status__c` | Picklist *restricted*, default `Pending` | | | | `Pending`, `Processing`, `Retry Scheduled`, `Succeeded`, `Failed` |
+| `Retry_Count__c` | Number(3,0) | | | | Retries performed (attempts = `Retry_Count + 1`) |
+| `Next_Retry_At__c` | Date/Time | | | | When another attempt becomes eligible |
+| `Last_Attempt_At__c` | Date/Time | | | | Most recent attempted callout |
+| `Processing_Started_At__c` | Date/Time | | | | Detects abandoned claims |
+| `Claim_Token__c` | Text(36) | | | | v4 UUID, **new per attempt** |
+| `Last_Status_Code__c` | Number(3,0) | | | | Most recent HTTP status |
+| `Last_Error_Code__c` | Text(80) | | | | **Controlled vocabulary only** |
+| `External_Record_Id__c` | Text(36) | ✅ | ✅ | | Attorney's durable UUID |
+| `External_Salesforce_Id__c` | Text(18) | | | | Foreign org record Id — **diagnostics only** |
+| `Succeeded_At__c` | Date/Time | | | | Final successful completion |
+
+**Never on this object:** raw error messages, request payloads, responses. Attempts belong in
+`Integration_Log__c`, sanitized.
+
+### Lookup, not Master-Detail — and why the platform agreed
+
+Master-Detail would cascade-delete integration history with its parent, couple ownership, and **lock
+the parent `Referral__c` on every attempt update** (a retry storm would serialize on the referral).
+
+A **required Lookup** forces a delete-semantics decision that Master-Detail makes silently for you.
+Salesforce rejected the deploy until one was declared:
+
+```
+field integrity exception: must specify either cascade delete or restrict delete
+for required lookup foreign key
+```
+
+`Cascade` is ruled out by the very reason we avoided MD. So: **`Restrict`** — a referral with
+transmissions cannot be deleted. **You cannot accidentally erase the audit trail.**
+
+### `External_Record_Id__c` is Unique
+
+Two transmissions holding the same Attorney case UUID would mean remote idempotency is broken. That
+should surface loudly at the database, not be discovered later.
+
+## Uniqueness — forever, never status-dependent
+
+```
+Transmission_Key__c = <18-char Referral Id> | <target code> | <operation code>
+
+a0B5g0000012345EAA|ATTORNEY|CREATE_REFERRAL
+```
+
+**One referral has exactly one logical Attorney-create transmission — permanently.** Retries and
+manual resubmissions **reuse that record and its correlation ID**. They never create another.
+
+> ⚠️ **`Status__c` must never be part of the key.** With status in the key, flipping to `Succeeded`
+> or `Failed` frees the old slot and a duplicate row for the same business operation slips in
+> through the back door. That would be a duplicate achieved *accidentally*.
+
+**If multiple independent transmissions are ever genuinely needed** for the same operation, add an
+explicit `Source_Event_Id__c` or generation number to the key. Make it deliberate and visible —
+never a side effect of status.
+
+### The key uses stable codes, not picklist labels
+
+The key is built from a **code**, not the picklist value:
+
+| `Target_System__c` value | code |
+|---|---|
+| `Attorney` | `ATTORNEY` |
+| `Provider` | `PROVIDER` |
+
+| `Operation__c` value | code |
+|---|---|
+| `Create Referral` | `CREATE_REFERRAL` |
+
+**Why this matters.** If the key were derived from the label, an admin renaming `Attorney` →
+`Attorney Firm` would **silently change the key for every new row** while existing rows kept the old
+one — uniqueness would quietly stop working, and duplicates would appear with no error.
+
+**Protection.** An explicit Apex *value → code* map, plus a drift-guard test asserting every active
+picklist value has a code. A rename then **fails the build** instead of corrupting the key, and
+existing keys stay valid because the code is decoupled from the label. Same pattern as the Attorney
+org's `Case_Type__c` guard.
+
+## State machine
+
+```
+      Pending
+         │ claim
+         ▼
+    Processing ──── valid successful response ────► Succeeded (terminal)
+         │
+         ├──────── transient failure (budget left) ─► Retry Scheduled
+         ├──────── transient failure (budget gone) ─► Failed
+         ├──────── permanent failure ───────────────► Failed
+         │
+         └──────── abandoned/stale claim ──────────► Retry Scheduled
+
+  Retry Scheduled ── due time reached and claimed ─► Processing
+
+  Failed ────────── manual retry ───────────────────► Retry Scheduled
+                                          (same Correlation_Id__c)
+```
+
+### Transition table — the normative rules
+
+| # | From | Event | To | Field writes |
+|---|---|---|---|---|
+| 1 | *(none)* | Referral becomes eligible | **Pending** | `Correlation_Id = Uuid.v4()` **once**; `Transmission_Key = key`; `Retry_Count = 0` |
+| 2 | Pending | claimed | **Processing** | `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now`. **`Retry_Count` unchanged** — this is attempt 1, not a retry |
+| 3 | Retry Scheduled *(`Next_Retry_At <= now`)* | claimed | **Processing** | **`Retry_Count++`**; `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now` |
+| 4 | Processing | **valid** success response | **Succeeded** | `External_Record_Id`, `External_Salesforce_Id`, `Last_Status_Code`, `Succeeded_At = now`; clear `Claim_Token`, `Next_Retry_At`, `Last_Error_Code` |
+| 5 | Processing | transient failure, `Retry_Count < MAX_RETRIES` | **Retry Scheduled** | `Last_Status_Code`, `Last_Error_Code`, `Next_Retry_At = backoff`; clear `Claim_Token`, `Processing_Started_At` |
+| 6 | Processing | transient failure, `Retry_Count >= MAX_RETRIES` | **Failed** | `Last_Status_Code`, `Last_Error_Code = RETRY_BUDGET_EXHAUSTED`; clear `Claim_Token` |
+| 7 | Processing | permanent failure | **Failed** | `Last_Status_Code`, `Last_Error_Code`; clear `Claim_Token` |
+| 8 | Processing *(`Processing_Started_At < now - STALE_AFTER`)* | recovery sweep | **Retry Scheduled** | `Last_Error_Code = STALE_CLAIM_RECOVERED`; `Next_Retry_At = now`; clear `Claim_Token`, `Processing_Started_At` |
+| 9 | Failed | manual retry | **Retry Scheduled** | `Retry_Count = 0`; `Next_Retry_At = now`; clear `Last_Error_Code`. **`Correlation_Id` unchanged** |
+| 10 | Succeeded | — | *terminal* | No transition out. Ever. |
+
+### Invariants
+
+1. `Correlation_Id__c` is **immutable** after insert — including on manual retry.
+2. `Transmission_Key__c` is **immutable** after insert.
+3. **Succeeded is terminal.**
+4. Only **Pending** or **Retry Scheduled** (and due) are claim-eligible.
+5. `Claim_Token__c` is non-null **only** while `Status = Processing`.
+6. `Retry_Count__c` increments **only** on transition #3.
+7. `Next_Retry_At__c` is meaningful **only** in Retry Scheduled.
+8. `External_Record_Id__c` is written **only** on transition #4, and only after validation.
+
+### `Retry_Count__c` — exact semantics
+
+`Retry_Count` counts **retries**, not attempts. Attempts = `Retry_Count + 1`.
+
+With `MAX_RETRIES = 3`:
+
+| Attempt | Claimed from | `Retry_Count` during | Transient failure → |
+|---|---|---|---|
+| 1 | Pending | 0 | `0 >= 3`? No → Retry Scheduled |
+| 2 | Retry Scheduled | 1 | `1 >= 3`? No → Retry Scheduled |
+| 3 | Retry Scheduled | 2 | `2 >= 3`? No → Retry Scheduled |
+| 4 | Retry Scheduled | 3 | `3 >= 3`? **Yes → Failed** |
+
+Total: 4 attempts = 1 initial + 3 retries.
+
+**A stale-recovered attempt is still counted**, because recovery (#8) returns to Retry Scheduled and
+the next claim (#3) increments. A job that dies every time is therefore still bounded — it cannot
+loop forever.
+
+## `Processing` cannot be the lock
+
+This is **unsafe** and must not be written:
+
+```apex
+if (transmission.Status__c == 'Pending') {   // two jobs can both read Pending
+    transmission.Status__c = 'Processing';   // before either commits
+    update transmission;
+    performCallout();                        // ...and both send
+}
+```
+
+### Two-transaction claim design
+
+**Transaction 1 — claim** (`ClaimAttorneyTransmissionQueueable`, **no callout**)
+
+1. `SELECT ... FROM Integration_Transmission__c WHERE Id = :id FOR UPDATE` — the row lock makes only
+   one job capable of claiming.
+2. Verify `Status = Pending`, or `Status = Retry Scheduled AND Next_Retry_At <= now`. Otherwise
+   **exit silently** — someone else won, and that is a normal outcome, not an error.
+3. `Status = Processing`; `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`;
+   `Last_Attempt_At = now`; increment `Retry_Count` if claiming from Retry Scheduled.
+4. Enqueue the callout job with **transmission Id + claim token**.
+
+> **`FOR UPDATE` can throw `UNABLE_TO_LOCK_ROW`** when another transaction holds the lock. That means
+> *"someone else is claiming it"* — a **normal outcome**. Catch it and exit cleanly. Do **not** let it
+> surface as a 500 or a failed transmission.
+
+**Transaction 2 — send** (`SendReferralToAttorneyQueueable`)
+
+1. Reload the transmission.
+2. Confirm `Status = Processing` **and** the supplied claim token **matches**. Otherwise **exit
+   without sending** — this job is stale or duplicate.
+3. Build the request → **callout** → validate the response.
+4. Update transmission state → write **exactly one** attempt log.
+
+This also satisfies the platform rule that a callout cannot follow DML in the same transaction: T1
+does the DML, T2 does SOQL → callout → DML.
+
+### The three identifiers, and why each exists
+
+| | Scope | Purpose |
+|---|---|---|
+| `Correlation_Id__c` | One per **logical transmission** | End-to-end tracing across both orgs. Reused by every attempt. |
+| `Claim_Token__c` | One per **attempt** | Local concurrency safety. Proves a job is the *currently authorized* attempt. |
+| `Retry_Count__c` | Per transmission | Operational: which attempt is this, and is the budget spent? |
+
+Tracing and concurrency safety are different problems. One identifier cannot do both: a correlation
+id that changed per attempt would destroy tracing; a claim token reused across attempts would not
+stop a stale job.
+
+## Response validation — 2xx is not success
+
+**An HTTP 2xx alone does not mean the transmission succeeded.** Before persisting any Attorney
+identifier, **all** must hold:
+
+| Check | On failure |
+|---|---|
+| `response.success == true` | treat as failure |
+| `response.correlationId == transmission.Correlation_Id__c` | `INVALID_RESPONSE` |
+| `response.attorneyCaseId` is a valid **v4 UUID** | `INVALID_RESPONSE` |
+| `response.attorneyCaseRecordId` is null **or** a valid 18-char Salesforce Id | `INVALID_RESPONSE` |
+| required status fields present | `INVALID_RESPONSE` |
+
+**Do not validate the key prefix of `attorneyCaseRecordId`.** It belongs to a **foreign** Salesforce
+org, and custom key prefixes are assigned per-org. Asserting one would couple us to a value Attorney
+never promised. *(Same reasoning the Attorney org applies to our referral Ids, in the other
+direction.)*
+
+**A malformed response or a correlation mismatch → `Retry Scheduled`, `Last_Error_Code = INVALID_RESPONSE`.**
+Retrying is safe: Attorney inbound is idempotent by Care Connect referral Id, so a retry cannot
+create a duplicate case. The retry budget bounds a persistently malformed contract.
+
+> **This is Phase 3's lesson applied symmetrically.** We spent five review rounds making Attorney
+> refuse untrusted input from Care Connect. A response is untrusted input too — including from a
+> system we wrote.
+
+## Failure classification
+
+`Last_Error_Code__c` holds a **controlled internal vocabulary only** — never a remote message, never
+a platform exception message. An unrecognised condition maps to `UNKNOWN`.
+
+| Code | Trigger | Class |
+|---|---|---|
+| `RATE_LIMITED` | 429 | **transient** |
+| `SERVER_ERROR` | 500, 502, 503, 504 | **transient** |
+| `TIMEOUT` | 408 / callout timeout | **transient** |
+| `CALLOUT_FAILED` | `CalloutException` | **transient** |
+| `INVALID_RESPONSE` | failed response validation | **transient** |
+| `VALIDATION_REJECTED` | 400 | **permanent** |
+| `UNAUTHORIZED` | 401, 403 | **permanent** |
+| `NOT_FOUND` | 404 | **permanent** |
+| `CONFLICT` | 409 | **permanent** |
+| `RETRY_BUDGET_EXHAUSTED` | transient failure with no budget left | **terminal** |
+| `STALE_CLAIM_RECOVERED` | recovery sweep | *(returns to Retry Scheduled)* |
+| `UNKNOWN` | anything unclassified | **transient** |
+
+**400 is permanent, deliberately.** The Attorney API rejects on a field-level rule; retrying an
+unchanged request is *guaranteed* to fail identically. **500 is transient and safe to retry**
+precisely because Attorney inbound is idempotent.
+
+`Last_Error_Code__c` is `Text(80)` rather than a restricted picklist on purpose: an unclassified
+condition must degrade to `UNKNOWN`, not fail the DML that is trying to record a failure.
+
+## Bulk: the trigger must not enqueue per referral
+
+`System.enqueueJob` is capped at **50 per transaction**. A trigger enqueuing one claim job per
+referral throws `LimitException` on a 200-record insert — **and the referral insert itself fails.**
+The integration would take the business process down with it.
+
+**Rule: the trigger enqueues at most ONE dispatcher per transaction.** The dispatcher claims a
+bounded batch and chains. The scheduled sweeper (below) is the safety net and the uniform path for
+retries.
+
+## Recovery sweep
+
+A scheduled job — **not** a chained Queueable — drives:
+
+```sql
+SELECT Id FROM Integration_Transmission__c
+WHERE (Status__c = 'Pending')
+   OR (Status__c = 'Retry Scheduled' AND Next_Retry_At__c <= :now)
+   OR (Status__c = 'Processing'      AND Processing_Started_At__c < :staleCutoff)
+```
+
+Scheduled Apex rather than chained Queueables because it (a) is not bound by the Queueable delay cap,
+so real exponential backoff is possible, and (b) reclaims stranded `Processing` rows. Chained
+Queueables can do neither — and a Queueable that dies from an uncatchable limit exception leaves a row
+stranded in `Processing` forever: never retried, never failed, invisible.
+
+## Backoff
+
+`Next_Retry_At = Last_Attempt_At + BASE * 2^Retry_Count`, capped at `MAX_BACKOFF`.
+With `BASE = 1 min`: retries at ~+1m, +2m, +4m. Constants live in one place; custom metadata later.
+
+## Not yet built
+
+**Status: Planned for Phase 4** — nothing below exists, and this document does not describe it:
+
+`Uuid.cls` copy into Care Connect · transmission creation/claim service · `AttorneyReferralRequest` ·
+`AttorneyReferralResponse` · response validation · `AttorneyApiService` · claim Queueable · callout
+Queueable · trigger + handler eligibility · retry and stale-processing recovery · Named Credential /
+Connected App · `HttpCalloutMock` tests.
+
+**No callout code may be written until this specification is approved.**
+
+## Tests this specification demands
+
+| Test | Asserts |
+|---|---|
+| Duplicate claim prevention | Two claims on one transmission → exactly one sends |
+| Stale claim token | A job with an outdated token exits without sending |
+| Stale processing recovery | `Processing` past the cutoff → Retry Scheduled, budget still bounded |
+| Correlation reuse | Every attempt of one transmission shares one `Correlation_Id__c` |
+| Claim token rotation | Each attempt gets a **new** `Claim_Token__c` |
+| Response validation | Correlation mismatch / non-v4 id / `success:false` → `INVALID_RESPONSE`, nothing persisted |
+| Retry budget | Exactly `MAX_RETRIES` retries, then Failed |
+| Transient vs permanent | 400 → Failed immediately; 500 → Retry Scheduled |
+| Duplicate transmission | Same (referral, target, operation) → `DUPLICATE_VALUE`, resolved to the existing row |
+| Bulk trigger | 200 referrals inserted → no `LimitException` |
+| Key stability | Renaming a picklist label fails the drift guard rather than corrupting the key |
