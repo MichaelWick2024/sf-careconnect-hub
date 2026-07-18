@@ -2,7 +2,7 @@
 
 > **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
 > **Audience** Salesforce developers building or maintaining Care Connect outbound.
-> **Status** Object metadata deployed; the **state-machine / callout Apex is not built yet** and remains gated on this specification. Supporting Apex that predates it — `Uuid` (PR #2, merged) and the `AttorneyReferralRequest` / `AttorneyReferralResponse` DTOs (PR #3) — does exist; see the Build status section below.
+> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, and `AttorneyApiService` (callout + classification) — exists (see Build status below). The **claim/send state machine that drives the transitions in this document is not built yet** and remains gated on this specification.
 > **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`.
 > **Owner** Care Connect integration team.
 > **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Transmission_Support` (read-only), `permissionsets/Integration_Transmission_Runtime` (execution path). `Integration_Admin` deliberately does **not** cover this object.
@@ -451,11 +451,12 @@ a platform exception message. An unrecognised condition maps to `UNKNOWN`.
 
 | Code | Trigger | Class |
 |---|---|---|
+| `INVALID_REQUEST` | local request validation failed — **no callout is made** | **permanent** (a request we built wrong; retrying it unchanged cannot help) |
 | `RATE_LIMITED` | 429 | **transient** |
 | `SERVER_ERROR` | 500, 502, 503, 504 | **transient** |
-| `TIMEOUT` | 408 / callout timeout | **transient** |
-| `CALLOUT_FAILED` | `CalloutException` | **transient** |
-| `INVALID_RESPONSE` | failed response validation | **transient** |
+| `TIMEOUT` | HTTP **408** only | **transient** |
+| `CALLOUT_FAILED` | any thrown `System.CalloutException`, **including a client-side callout timeout** | **transient** |
+| `INVALID_RESPONSE` | 2xx that fails response validation (or an unparseable 2xx body) | **transient** |
 | `VALIDATION_REJECTED` | 400 | **permanent** |
 | `UNAUTHORIZED` | 401, 403 | **permanent** |
 | `NOT_FOUND` | 404 | **permanent** |
@@ -554,24 +555,39 @@ budget is spent.
 `Next_Retry_At = Last_Attempt_At + BASE * 2^Retry_Count`, capped at `MAX_BACKOFF`.
 With `BASE = 1 min`: retries at ~+1m, +2m, +4m. Constants live in one place; custom metadata later.
 
+## Live authentication configuration (split across orgs)
+
+`AttorneyApiService` calls `callout:Attorney_API`. Wiring that up is a **config** task, split across the
+two orgs — easy to get backwards:
+
+| Component | Lives in | Role |
+|---|---|---|
+| **Connected App** (OAuth Client Credentials) | **Attorney** (target) org | Issues tokens; has a run-as integration user |
+| **External Credential** + **Named Credential** `Attorney_API` | **Care Connect** (this, calling) org | Defines the endpoint + auth Apex here uses; holds the consumer key/secret as a principal |
+
+A Named Credential defines the outbound endpoint and authentication used by Apex in the **calling**
+org — so it belongs here, not in Attorney. Apex never sees a secret: it uses `callout:Attorney_API`
+and the platform injects auth. Tests use `HttpCalloutMock` and need none of this.
+
 ## Build status (Phase 4)
 
 **Implemented and merged/​in-flight:**
 
 - ✅ `Uuid` + tests — merged (PR #2)
-- ✅ `AttorneyReferralRequest` / `AttorneyReferralResponse` DTOs + tests — implemented (PR #3)
+- ✅ `AttorneyReferralRequest` / `AttorneyReferralResponse` DTOs + tests — merged (PR #3)
+- ✅ `AttorneyReferralResponseValidator` (the five response checks) + tests — merged (PR #4)
+- ✅ `AttorneyReferralRequestValidator` (pre-callout request checks → `INVALID_REQUEST`) + tests — in-flight
+- ✅ `AttorneyApiService` (callout, HTTP → controlled-error classification, value-safe allowlisted
+  logging via `HttpCalloutMock`) — in-flight
 
 **Still to build — this document is the contract for it:**
 
-- ⏳ **Response validation** (next) — enforces the success-response rules above (`success == true`,
-  correlation match, v4 `attorneyCaseId`, null-or-18-char `attorneyCaseRecordId`, **`status`
-  nonblank**) before any Attorney identifier is persisted
-- ⏳ transmission creation/claim service · `AttorneyApiService` · claim Queueable · callout Queueable ·
-  trigger + handler eligibility · retry and stale-processing recovery · Named Credential / Connected
-  App · `HttpCalloutMock` tests
+- ⏳ transmission creation/claim service · claim Queueable · callout Queueable (the serial chain) ·
+  trigger + handler eligibility · retry and stale-processing recovery sweep · the live Named
+  Credential / Connected App config (see *Live authentication configuration* above)
 
-The DTOs above are pure contract objects with no callout, mapping, or persistence logic; the
-callout code they support is still gated on this specification.
+`AttorneyApiService` returns a controlled `CalloutOutcome`; it does not persist. The state machine
+that consumes it — claim, send, and the transition writes above — is the remaining work.
 
 ## Tests this specification demands
 
