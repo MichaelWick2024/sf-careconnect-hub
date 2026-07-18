@@ -29,12 +29,22 @@ Attorney Org  ◄── REST ──►  Care Connect (this repo)  ◄── REST
 
 ## Status
 
+**Schema & config**
+
 | Component | State |
 |---|---|
 | `Referral__c`, `Integration_Log__c` | ✅ Deployed |
 | `Integration_Transmission__c` (outbound state model) | ✅ Deployed |
-| `Integration_Admin` permission set, page layouts | ✅ Deployed |
-| **Apex** | ❌ **None yet** — gated on approval of the state specification |
+| Permission sets, page layouts | ✅ Deployed |
+
+**Outbound Apex** (Phase 4, in sequence)
+
+| Class | State |
+|---|---|
+| `Uuid` | ✅ Merged |
+| `AttorneyReferralRequest` / `AttorneyReferralResponse` | ✅ Implemented |
+| Response validation | ⏳ Next |
+| API service · Queueables · trigger | ⏳ Planned |
 
 ## Documentation
 
@@ -50,8 +60,10 @@ architecture decision records that are **binding on this org's outbound work**.
 ```
 force-app/main/default/
 ├── objects/          Referral__c, Integration_Log__c, Integration_Transmission__c
+├── classes/          Uuid, AttorneyReferralRequest/Response (+ tests)
 ├── layouts/
-└── permissionsets/   Integration_Admin
+└── permissionsets/   Integration_Admin,
+                      Integration_Transmission_Runtime, Integration_Transmission_Support
 docs/                 Architecture and specifications
 ```
 
@@ -61,8 +73,19 @@ docs/                 Architecture and specifications
 sf org login web --alias careconnect --instance-url https://login.salesforce.com
 sf config set target-org=careconnect          # pins this project to one org
 sf project deploy start -o careconnect -d force-app/main/default
-sf org assign permset -n Integration_Admin -o careconnect
+
+# Permission sets — the transmission object is deliberately NOT covered by Integration_Admin.
+sf org assign permset -n Integration_Admin -o careconnect                 # Referral__c, Integration_Log__c
+sf org assign permset -n Integration_Transmission_Runtime -o careconnect  # execution path: Integration_Transmission__c
+
+# For human/support users, assign the read-only set INSTEAD of Runtime:
+sf org assign permset -n Integration_Transmission_Support -o careconnect  # read-only investigation
 ```
+
+> ⚠️ **`Integration_Admin` does not grant access to `Integration_Transmission__c`** — that object is
+> governed by the two `Integration_Transmission_*` sets so ordinary editing can't bypass its state
+> machine (see [the spec](docs/01-outbound-transmission-state.md)). If transmission fields *"appear
+> not to exist"* after deploy, it's missing FLS, not a failed deploy: assign `Runtime` (or `Support`).
 
 `target-org` is set **locally per project**, so a deploy from this folder can only reach the Care
 Connect org. That is deliberate — it makes a cross-org mistake structurally hard.
