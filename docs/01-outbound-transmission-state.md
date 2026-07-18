@@ -2,8 +2,8 @@
 
 > **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
 > **Audience** Salesforce developers building or maintaining Care Connect outbound.
-> **Status** **Specification + object metadata only. No Apex exists yet.** This document is the approval gate for the callout code.
-> **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`. **No Apex in this org yet.**
+> **Status** Object metadata deployed; the **state-machine / callout Apex is not built yet** and remains gated on this specification. Supporting Apex that predates it — `Uuid` (PR #2, merged) and the `AttorneyReferralRequest` / `AttorneyReferralResponse` DTOs (PR #3) — does exist; see the Build status section below.
+> **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`.
 > **Owner** Care Connect integration team.
 > **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Transmission_Support` (read-only), `permissionsets/Integration_Transmission_Runtime` (execution path). `Integration_Admin` deliberately does **not** cover this object.
 
@@ -396,7 +396,7 @@ identifier, **all** must hold:
 | `response.correlationId == transmission.Correlation_Id__c` | `INVALID_RESPONSE` |
 | `response.attorneyCaseId` is a valid **v4 UUID** | `INVALID_RESPONSE` |
 | `response.attorneyCaseRecordId` is null **or** a valid 18-char Salesforce Id | `INVALID_RESPONSE` |
-| required status fields present | `INVALID_RESPONSE` |
+| `response.status` is **nonblank** (`String.isNotBlank`) — not merely "present": a key can be present with a null, `""`, or whitespace value | `INVALID_RESPONSE` |
 
 **Do not validate the key prefix of `attorneyCaseRecordId`.** It belongs to a **foreign** Salesforce
 org, and custom key prefixes are assigned per-org. Asserting one would couple us to a value Attorney
@@ -554,16 +554,24 @@ budget is spent.
 `Next_Retry_At = Last_Attempt_At + BASE * 2^Retry_Count`, capped at `MAX_BACKOFF`.
 With `BASE = 1 min`: retries at ~+1m, +2m, +4m. Constants live in one place; custom metadata later.
 
-## Not yet built
+## Build status (Phase 4)
 
-**Status: Planned for Phase 4** — nothing below exists, and this document does not describe it:
+**Implemented and merged/​in-flight:**
 
-`Uuid.cls` copy into Care Connect · transmission creation/claim service · `AttorneyReferralRequest` ·
-`AttorneyReferralResponse` · response validation · `AttorneyApiService` · claim Queueable · callout
-Queueable · trigger + handler eligibility · retry and stale-processing recovery · Named Credential /
-Connected App · `HttpCalloutMock` tests.
+- ✅ `Uuid` + tests — merged (PR #2)
+- ✅ `AttorneyReferralRequest` / `AttorneyReferralResponse` DTOs + tests — implemented (PR #3)
 
-**No callout code may be written until this specification is approved.**
+**Still to build — this document is the contract for it:**
+
+- ⏳ **Response validation** (next) — enforces the success-response rules above (`success == true`,
+  correlation match, v4 `attorneyCaseId`, null-or-18-char `attorneyCaseRecordId`, **`status`
+  nonblank**) before any Attorney identifier is persisted
+- ⏳ transmission creation/claim service · `AttorneyApiService` · claim Queueable · callout Queueable ·
+  trigger + handler eligibility · retry and stale-processing recovery · Named Credential / Connected
+  App · `HttpCalloutMock` tests
+
+The DTOs above are pure contract objects with no callout, mapping, or persistence logic; the
+callout code they support is still gated on this specification.
 
 ## Tests this specification demands
 
