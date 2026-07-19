@@ -42,9 +42,11 @@ Attorney Org  ◄── REST ──►  Care Connect (this repo)  ◄── REST
 | Class | State |
 |---|---|
 | `Uuid` | ✅ Merged |
-| `AttorneyReferralRequest` / `AttorneyReferralResponse` | ✅ Implemented |
-| Response validation | ⏳ Next |
-| API service · Queueables · trigger | ⏳ Planned |
+| `AttorneyReferralRequest` / `AttorneyReferralResponse` DTOs | ✅ Merged |
+| `AttorneyReferralResponseValidator` (five response checks) | ✅ Merged |
+| `AttorneyReferralRequestValidator` (pre-callout checks) | ✅ Implemented (PR #5) |
+| `AttorneyApiService` (callout + classification + value-safe logging) | ✅ Implemented (PR #5) |
+| Claim/send Queueables · trigger · retry & stale sweep | ⏳ Planned |
 
 ## Documentation
 
