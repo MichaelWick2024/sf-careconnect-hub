@@ -2,7 +2,7 @@
 
 > **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
 > **Audience** Salesforce developers building or maintaining Care Connect outbound.
-> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, `AttorneyReferralRequestMapper`, and `AttorneyTransmissionService` (create/claim **#1–#3** plus the **#4–#8b outcome-application methods** `applySendOutcome`/`applyExternalConflict`/`applyStaleRecovery`) — exists (see Build status below). All transition *logic* is now a synchronous, unit-tested layer. The **Queueable chain that invokes the send transitions, the trigger, and the recovery sweep are not built yet** and remain gated on this specification.
+> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, `AttorneyReferralRequestMapper`, and `AttorneyTransmissionService` (create/claim **#1–#3** plus the **#4–#8b outcome-application methods** `applySendOutcome`/`applyExternalConflict`/`applyStaleRecovery`) — exists (see Build status below). All transition *logic* is a synchronous, unit-tested layer, and the **serial Queueable chain** (`AttorneyDispatchQueueable` → `AttorneySendQueueable`) now invokes the send transitions #4–#7b end to end, with the post-callout `FOR UPDATE` re-lock and token-gated application. The **trigger (enqueue on new referrals) and the scheduled recovery sweep (#8) are not built yet** and remain gated on this specification.
 > **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`.
 > **Owner** Care Connect integration team.
 > **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Transmission_Support` (read-only), `permissionsets/Integration_Transmission_Runtime` (execution path). `Integration_Admin` deliberately does **not** cover this object.
@@ -330,26 +330,30 @@ if (transmission.Status__c == 'Pending') {   // two jobs can both read Pending
 > *"someone else is claiming it"* — a **normal outcome**. Catch it and exit cleanly. Do **not** let it
 > surface as a 500 or a failed transmission.
 
-**Transaction 2 — send** (`SendReferralToAttorneyQueueable`)
+**Transaction 2 — send** (`AttorneySendQueueable`) — for a claimed batch of up to `MAX_CLAIM_BATCH`:
 
-1. Reload the transmission.
-2. Confirm `Status = Processing` **and** the supplied claim token **matches**. Otherwise **exit
-   without sending** — this job is stale or duplicate. *(This pre-callout check is only an early-exit
-   optimization; it is not sufficient — see step 5.)*
-3. Build the request → **callout** → validate the response.
-4. **Re-lock and re-verify.** Requery the row **`FOR UPDATE`** and confirm `Status = Processing` **and**
-   the claim token **still matches**, immediately before the write. A callout can run up to the
-   per-attempt timeout, and during it the recovery sweep may declare the claim stale and re-claim the
-   row with a **new** token. The pre-callout check (step 2) cannot see that; this is the **authoritative**
-   check.
-5. Apply the outcome **only if authorized** (`applySendOutcome` enforces the token/status gate and
-   returns `applied = false, reason = 'stale-claim'` otherwise, leaving the row untouched) → write
-   **exactly one** attempt log. A refused row is not an error — it is the newer attempt correctly
-   winning; the stale sender's *request* already reached Attorney, and Attorney's idempotency absorbs
-   the duplicate (see *Delivery guarantee*).
+1. Reload the rows (with their auth fields + Referral/Contact fields).
+2. **Pre-callout authorization** (per row): send only if `Status = Processing` **and** the supplied
+   claim token **matches**. A row already detectably stale gets **no callout and no log** — no attempt
+   was made. *(This is only an early-exit optimization; it is not sufficient — see step 4.)*
+3. Build each request → **callout** → validate the response. All callouts happen before any DML.
+4. **Re-lock and re-verify, per row and SINGULARLY.** Requery each row with its own
+   `WHERE Id = :id FOR UPDATE` and confirm `Status = Processing` **and** the token **still matches**,
+   immediately before the write — the **authoritative** check (a callout can run up to the timeout, and
+   during it the sweep may re-claim the row with a new token). Locking is singular so one contested row
+   (`UNABLE_TO_LOCK_ROW`) does **not** fail the others; it is left `Processing` for recovery, and its
+   attempt is still logged because the callout occurred.
+5. Apply the outcome **only if authorized** (`applySendOutcome` enforces the token/status gate) and
+   persist with **genuine partial success** — no thrown exception, no all-or-none DML — so one row's
+   failure never rolls back another row's committed transition. A `DUPLICATE_VALUE` on a `Succeeded`
+   row is the #7b external-record collision. Then write attempt logs **best-effort**
+   (`Database.insert(logs, false)`) with each log's classification taken **after** local persistence
+   (a #7b logs `success = false`, status `200`, `EXTERNAL_RECORD_CONFLICT` — not the raw HTTP success).
+   Logging is best-effort and **must never roll back transmission state**; "one log per attempt" is the
+   intent, but Salesforce rejecting a log row cannot be allowed to undo the business transaction.
 
 This also satisfies the platform rule that a callout cannot follow DML in the same transaction: T1
-does the DML, T2 does SOQL → callout → SOQL(`FOR UPDATE`) → DML.
+does the DML, T2 does SOQL → callouts → SOQL(`FOR UPDATE`) → DML.
 
 The recovery sweep is subject to the **same discipline**: it must re-lock (`FOR UPDATE`) and
 re-evaluate `Processing_Started_At__c` before applying #8, because its candidate `SELECT` is a stale
@@ -508,7 +512,7 @@ Trigger transaction  (synchronous)
     │  enqueue ONCE  — guarded by a transaction-level static
     ▼
 Dispatcher / claimant  (async)
-    │  take a named, BOUNDED set of transmission ids (define MAX_CLAIM_BATCH)
+    │  take a named, BOUNDED set of transmission ids (MAX_CLAIM_BATCH = 3)
     │  call singular claim(Id) for each  — one WHERE Id = :id FOR UPDATE per call
     │  collect the successful {transmissionId, claimToken} pairs
     │  enqueue EXACTLY ONE sender
@@ -523,8 +527,9 @@ Dispatcher / claimant  …
 Claiming is **singular** (`AttorneyTransmissionService.claim(Id)`), not a batch `FOR UPDATE`, so a
 lock failure classifies **one** transmission as `locked` rather than the whole group. It still runs
 inside one dispatcher transaction, so a contested row can delay the dispatcher and locks already
-acquired stay held until the transaction ends — which is exactly why the batch must be **bounded**
-(the next PR defines `MAX_CLAIM_BATCH`; Salesforce lock guidance recommends smaller transactions).
+acquired stay held until the transaction ends — which is exactly why the batch is **bounded** at
+`MAX_CLAIM_BATCH = 3` (Salesforce lock guidance recommends smaller transactions, and — the binding
+constraint — the sender's per-transaction cumulative callout budget: `3 × 30 s = 90 s ≤ 120 s`).
 
 ### Normative rules
 
@@ -535,17 +540,32 @@ acquired stay held until the transaction ends — which is exactly why the batch
 2. **A dispatcher enqueues exactly one sender.** Never one per transmission.
 
 3. **A sender performs every callout before any DML.** A callout may not follow DML in the same
-   transaction, so a batched sender cannot call out → save → call out again. Either:
-   - **(a)** perform all callouts for the claimed group, holding results in memory, then persist once
-     — bounded by the 100-callout limit (use ~50 for headroom); or
-   - **(b)** process exactly one transmission per sender transaction.
+   transaction, so a batched sender cannot call out → save → call out again. **The implemented design:
+   perform all callouts for the claimed group (≤ `MAX_CLAIM_BATCH = 3`), holding results in memory,
+   then persist once.** The batch is bounded not by the 100-callout limit but by the tighter
+   **cumulative callout timeout** (120 s per transaction): `3 × 30 s = 90 s` leaves ~30 s of headroom.
 
-   **(a)** is more efficient; **(b)** has a smaller blast radius if the transaction dies after the
-   callouts but before the DML. Under (a) that strands the whole claimed group in `Processing`, and
-   every one of them has *already been delivered* — recovery will re-send them all. Attorney's
+   The tradeoff of batching over one-transmission-per-sender is blast radius: if the transaction dies
+   after the callouts but before the DML, the whole claimed group is stranded in `Processing`, and
+   every one has *already been delivered* — recovery re-sends them all. A batch of 3 keeps that radius
+   small. Attorney's
    idempotency absorbs it (see *Delivery guarantee*), but the tradeoff should be a deliberate choice.
 
 4. **A sender enqueues at most one next dispatcher**, only when work remains — this is the chain.
+
+5. **The chain respects a maximum stack depth.** Salesforce caps chained-Queueable depth (5 in
+   Developer/Trial orgs), and an enqueue that hits the ceiling throws **after** the transaction's DML —
+   rolling back its committed state and logs. So every link checks `System.AsyncInfo` **before**
+   enqueuing (`AttorneyDispatchQueueable.canEnqueueChild()`, which **fails closed** — an unexpected
+   `AsyncException` stops the chain rather than enqueuing): the dispatcher checks **before claiming**
+   (claiming without the capacity to dispatch a sender would strand rows in `Processing`); the sender
+   checks before enqueuing the next dispatcher (its own results stay committed, the leftover goes to the
+   sweep). **Every ROOT enqueue — the trigger AND the scheduled sweep — must use the same dispatcher
+   root-enqueue method** that sets an explicit `MaximumQueueableStackDepth` via `AsyncOptions`, so the
+   ceiling is a deliberate value rather than the platform default; a root that skipped it would start an
+   unconfigured chain (`hasMaxStackDepth() = false`) with no protection. Chained dispatcher/sender
+   enqueues use ordinary `System.enqueueJob` and inherit the maximum. When work is dropped at the
+   ceiling, the scheduled sweep resurfaces it — no transmission is lost, only deferred.
 
 The scheduled sweeper is the safety net and the uniform path for retries and stale recovery.
 
@@ -607,18 +627,20 @@ and the platform injects auth. Tests use `HttpCalloutMock` and need none of this
   send Queueable does, and end-to-end logging safety is only proven once they are tested together)
   — merged (PR #5)
 - ✅ `AttorneyTransmissionService` — **transitions #1–#3** (create-or-get + `FOR UPDATE` claim) + tests — merged (PR #6)
-- ✅ `AttorneyTransmissionService` — **#4–#8b outcome application** (`applySendOutcome` #4–#7, `applyExternalConflict` #7b, `applyStaleRecovery` #8a/#8b) + backoff, and `AttorneyReferralRequestMapper` (`Referral__c`/`Contact` → request DTO) + tests — in-flight (PR #7)
+- ✅ `AttorneyTransmissionService` — **#4–#8b outcome application** (`applySendOutcome` #4–#7, `applyExternalConflict` #7b, `applyStaleRecovery` #8a/#8b) + backoff, and `AttorneyReferralRequestMapper` (`Referral__c`/`Contact` → request DTO) + tests — merged (PR #7)
+- ✅ the serial Queueable chain — `AttorneyDispatchQueueable` (loops singular claim over `MAX_CLAIM_BATCH = 3`, enqueues one sender, carries leftover) → `AttorneySendQueueable` (all callouts first, post-callout `FOR UPDATE` re-lock, token-gated `applySendOutcome` #4–#7b, one `Integration_Log__c` per attempt, enqueues one next dispatcher) + `AttorneyApiService.TIMEOUT_MS = 30 s` + tests — in-flight (PR #8)
 
 **Still to build — this document is the contract for it:**
 
-- ⏳ the serial Queueable chain (dispatcher → claim → sender) that INVOKES the now-executable send
-  transitions (`MAX_CLAIM_BATCH = 3`, per-callout timeout `30 s`) · trigger + handler eligibility ·
-  retry and stale-processing recovery sweep (invokes `applyStaleRecovery`) · the live Named Credential
-  / Connected App config (see *Live authentication configuration* above)
+- ⏳ the trigger + handler eligibility (enqueues the FIRST dispatcher, guarded by a transaction-level
+  static) · the scheduled retry / stale-processing recovery sweep (re-locks and invokes
+  `applyStaleRecovery` #8) · the live Named Credential / Connected App config (see *Live authentication
+  configuration* above)
 
-Every transition #1–#8b is now executable and unit-tested (`AttorneyTransmissionService`). What remains
-is the Queueable chain that consumes the claim + `AttorneyApiService`'s `CalloutOutcome` and applies #4–#8, the
-trigger, and the sweep.
+Every transition #1–#8b is executable and unit-tested (`AttorneyTransmissionService`), and the
+send chain (`AttorneyDispatchQueueable` → `AttorneySendQueueable`) drives #4–#7b end to end. What
+remains is the trigger that starts the chain on new referrals and the scheduled sweep that drives
+retries and stale recovery (#8).
 
 ## Tests this specification demands
 
