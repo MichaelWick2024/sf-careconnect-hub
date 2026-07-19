@@ -25,8 +25,13 @@
  */
 public with sharing class AttorneyApiService {
 
-    private static final String ENDPOINT = 'callout:Attorney_API/services/apexrest/v1/referrals';
-    private static final Integer TIMEOUT_MS = 120000; // max; must stay below the sweep's STALE_AFTER
+    public static final String ENDPOINT = 'callout:Attorney_API/services/apexrest/v1/referrals';
+
+    // 30 s, NOT the 120 s platform max. The cumulative callout timeout is 120 s per Apex transaction,
+    // and the batching sender makes up to MAX_CLAIM_BATCH callouts in one transaction, so the guaranteed
+    // worst case is MAX_CLAIM_BATCH * TIMEOUT_MS; 3 * 30 s = 90 s leaves ~30 s of headroom. Still far
+    // below the sweep's STALE_AFTER (>= 15 min). AttorneySendQueueableTest pins the batch*timeout budget.
+    @TestVisible private static final Integer TIMEOUT_MS = 30000;
 
     // Ceiling on the response body we will parse. A Queueable can receive up to 12 MB and both the
     // request and response count against heap; the legal Attorney response is a few hundred chars

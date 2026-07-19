@@ -48,7 +48,8 @@ Attorney Org  ◄── REST ──►  Care Connect (this repo)  ◄── REST
 | `AttorneyApiService` (callout + classification + value-safe allowlisted log payloads) | ✅ Merged (PR #5) |
 | `AttorneyTransmissionService` — #1–#3 (create + claim) and #4–#8b outcome application | ✅ Implemented (PR #6, #7) |
 | `AttorneyReferralRequestMapper` — `Referral__c`/`Contact` → request DTO | ✅ Implemented (PR #7) |
-| Send/dispatcher Queueable chain (invokes #4–#8) · trigger · retry & stale sweep | ⏳ Planned |
+| `AttorneyDispatchQueueable` / `AttorneySendQueueable` — serial chain, invokes #4–#7b | ✅ Implemented (PR #8) |
+| Trigger (enqueue on new referrals) · retry & stale-recovery sweep (#8) | ⏳ Planned |
 
 ## Documentation
 

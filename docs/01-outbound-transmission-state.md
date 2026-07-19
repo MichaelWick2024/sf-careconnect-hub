@@ -2,7 +2,7 @@
 
 > **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
 > **Audience** Salesforce developers building or maintaining Care Connect outbound.
-> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, `AttorneyReferralRequestMapper`, and `AttorneyTransmissionService` (create/claim **#1–#3** plus the **#4–#8b outcome-application methods** `applySendOutcome`/`applyExternalConflict`/`applyStaleRecovery`) — exists (see Build status below). All transition *logic* is now a synchronous, unit-tested layer. The **Queueable chain that invokes the send transitions, the trigger, and the recovery sweep are not built yet** and remain gated on this specification.
+> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, `AttorneyReferralRequestMapper`, and `AttorneyTransmissionService` (create/claim **#1–#3** plus the **#4–#8b outcome-application methods** `applySendOutcome`/`applyExternalConflict`/`applyStaleRecovery`) — exists (see Build status below). All transition *logic* is a synchronous, unit-tested layer, and the **serial Queueable chain** (`AttorneyDispatchQueueable` → `AttorneySendQueueable`) now invokes the send transitions #4–#7b end to end, with the post-callout `FOR UPDATE` re-lock and token-gated application. The **trigger (enqueue on new referrals) and the scheduled recovery sweep (#8) are not built yet** and remain gated on this specification.
 > **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`.
 > **Owner** Care Connect integration team.
 > **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Transmission_Support` (read-only), `permissionsets/Integration_Transmission_Runtime` (execution path). `Integration_Admin` deliberately does **not** cover this object.
@@ -607,18 +607,20 @@ and the platform injects auth. Tests use `HttpCalloutMock` and need none of this
   send Queueable does, and end-to-end logging safety is only proven once they are tested together)
   — merged (PR #5)
 - ✅ `AttorneyTransmissionService` — **transitions #1–#3** (create-or-get + `FOR UPDATE` claim) + tests — merged (PR #6)
-- ✅ `AttorneyTransmissionService` — **#4–#8b outcome application** (`applySendOutcome` #4–#7, `applyExternalConflict` #7b, `applyStaleRecovery` #8a/#8b) + backoff, and `AttorneyReferralRequestMapper` (`Referral__c`/`Contact` → request DTO) + tests — in-flight (PR #7)
+- ✅ `AttorneyTransmissionService` — **#4–#8b outcome application** (`applySendOutcome` #4–#7, `applyExternalConflict` #7b, `applyStaleRecovery` #8a/#8b) + backoff, and `AttorneyReferralRequestMapper` (`Referral__c`/`Contact` → request DTO) + tests — merged (PR #7)
+- ✅ the serial Queueable chain — `AttorneyDispatchQueueable` (loops singular claim over `MAX_CLAIM_BATCH = 3`, enqueues one sender, carries leftover) → `AttorneySendQueueable` (all callouts first, post-callout `FOR UPDATE` re-lock, token-gated `applySendOutcome` #4–#7b, one `Integration_Log__c` per attempt, enqueues one next dispatcher) + `AttorneyApiService.TIMEOUT_MS = 30 s` + tests — in-flight (PR #8)
 
 **Still to build — this document is the contract for it:**
 
-- ⏳ the serial Queueable chain (dispatcher → claim → sender) that INVOKES the now-executable send
-  transitions (`MAX_CLAIM_BATCH = 3`, per-callout timeout `30 s`) · trigger + handler eligibility ·
-  retry and stale-processing recovery sweep (invokes `applyStaleRecovery`) · the live Named Credential
-  / Connected App config (see *Live authentication configuration* above)
+- ⏳ the trigger + handler eligibility (enqueues the FIRST dispatcher, guarded by a transaction-level
+  static) · the scheduled retry / stale-processing recovery sweep (re-locks and invokes
+  `applyStaleRecovery` #8) · the live Named Credential / Connected App config (see *Live authentication
+  configuration* above)
 
-Every transition #1–#8b is now executable and unit-tested (`AttorneyTransmissionService`). What remains
-is the Queueable chain that consumes the claim + `AttorneyApiService`'s `CalloutOutcome` and applies #4–#8, the
-trigger, and the sweep.
+Every transition #1–#8b is executable and unit-tested (`AttorneyTransmissionService`), and the
+send chain (`AttorneyDispatchQueueable` → `AttorneySendQueueable`) drives #4–#7b end to end. What
+remains is the trigger that starts the chain on new referrals and the scheduled sweep that drives
+retries and stale recovery (#8).
 
 ## Tests this specification demands
 
