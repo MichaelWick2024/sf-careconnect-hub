@@ -79,7 +79,9 @@ public with sharing class AttorneyDispatchQueueable implements Queueable {
      * platform default.
      *
      * AsyncInfo is only callable inside a Queueable/Finalizer; a direct unit-test call to execute() is
-     * not that context, so we treat the resulting AsyncException as "not depth-limited" and allow it.
+     * not that context. That accommodation is made EXPLICIT (Test.isRunningTest) so that in production
+     * the check FAILS CLOSED: an unexpected AsyncException stops the chain rather than proceeding with an
+     * enqueue the guard exists to prevent (in the sender that enqueue follows committed DML).
      */
     public static Boolean canEnqueueChild() {
         try {
@@ -87,7 +89,15 @@ public with sharing class AttorneyDispatchQueueable implements Queueable {
                 || System.AsyncInfo.getCurrentQueueableStackDepth()
                     < System.AsyncInfo.getMaximumQueueableStackDepth();
         } catch (System.AsyncException e) {
-            return true; // not in a Queueable execution context (e.g. a direct unit-test call)
+            // AsyncInfo is only callable inside a Queueable/Finalizer. A direct unit-test execute() call
+            // is not that context — accommodate it EXPLICITLY here (which also keeps the guard exercised
+            // by tests). In PRODUCTION an unexpected AsyncException must FAIL CLOSED: stop the chain
+            // rather than enqueue past a ceiling the guard exists to prevent.
+            if (Test.isRunningTest()) {
+                return true;
+            }
+            System.debug(LoggingLevel.ERROR, 'Queueable depth check failed; chain stopped.'); // no e.getMessage()
+            return false;
         }
     }
 }

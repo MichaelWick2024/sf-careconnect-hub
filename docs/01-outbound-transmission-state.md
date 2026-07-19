@@ -556,11 +556,15 @@ constraint — the sender's per-transaction cumulative callout budget: `3 × 30 
 5. **The chain respects a maximum stack depth.** Salesforce caps chained-Queueable depth (5 in
    Developer/Trial orgs), and an enqueue that hits the ceiling throws **after** the transaction's DML —
    rolling back its committed state and logs. So every link checks `System.AsyncInfo` **before**
-   enqueuing (`AttorneyDispatchQueueable.canEnqueueChild()`): the dispatcher checks **before claiming**
+   enqueuing (`AttorneyDispatchQueueable.canEnqueueChild()`, which **fails closed** — an unexpected
+   `AsyncException` stops the chain rather than enqueuing): the dispatcher checks **before claiming**
    (claiming without the capacity to dispatch a sender would strand rows in `Processing`); the sender
    checks before enqueuing the next dispatcher (its own results stay committed, the leftover goes to the
-   sweep). The **trigger** (next PR) sets an explicit `MaximumQueueableStackDepth` via `AsyncOptions`, so
-   the ceiling is a deliberate value rather than the platform default. When work is dropped at the
+   sweep). **Every ROOT enqueue — the trigger AND the scheduled sweep — must use the same dispatcher
+   root-enqueue method** that sets an explicit `MaximumQueueableStackDepth` via `AsyncOptions`, so the
+   ceiling is a deliberate value rather than the platform default; a root that skipped it would start an
+   unconfigured chain (`hasMaxStackDepth() = false`) with no protection. Chained dispatcher/sender
+   enqueues use ordinary `System.enqueueJob` and inherit the maximum. When work is dropped at the
    ceiling, the scheduled sweep resurfaces it — no transmission is lost, only deferred.
 
 The scheduled sweeper is the safety net and the uniform path for retries and stale recovery.

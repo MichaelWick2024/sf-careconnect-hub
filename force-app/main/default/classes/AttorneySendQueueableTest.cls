@@ -102,6 +102,11 @@ private class AttorneySendQueueableTest {
         claimNew(c.Id, 'Medical Malpractice');
         claimNew(c.Id, 'General');
 
+        // A claimed row whose referral has NO contact — the mapper produces a request the validator
+        // rejects locally (INVALID_REQUEST), so the sender never makes an HTTP call. Selected by the
+        // null contact, so it is invisible to rowOfType (which requires a contact).
+        claimNew(null, 'General');
+
         // Blocker owning the External_Record_Key the #7b test's success collides with (CONFLICT_UUID,
         // distinct from SUCCESS_UUID so it is inert for every other test).
         Referral__c rb = new Referral__c(Status__c = 'New', Referral_Type__c = 'General', Contact__c = c.Id);
@@ -124,7 +129,16 @@ private class AttorneySendQueueableTest {
         return [
             SELECT Id, Claim_Token__c, Correlation_Id__c, Referral__c
             FROM Integration_Transmission__c
-            WHERE Status__c = 'Processing' AND Referral__r.Referral_Type__c = :referralType LIMIT 1
+            WHERE Status__c = 'Processing' AND Referral__r.Referral_Type__c = :referralType
+              AND Referral__r.Contact__c != null LIMIT 1
+        ];
+    }
+
+    private static Integration_Transmission__c contactlessRow() {
+        return [
+            SELECT Id, Claim_Token__c, Correlation_Id__c, Referral__c
+            FROM Integration_Transmission__c
+            WHERE Status__c = 'Processing' AND Referral__r.Contact__c = null LIMIT 1
         ];
     }
 
@@ -330,8 +344,39 @@ private class AttorneySendQueueableTest {
         System.assertEquals('NOT_FOUND', log.Error_Message__c, 'the attempt is logged, the batch not aborted');
     }
 
+    // A request the mapper builds that the validator rejects LOCALLY (no contact -> invalid
+    // careConnectContactId): the API service returns INVALID_REQUEST WITHOUT an HTTP call, but the row
+    // still becomes Failed and still gets one controlled attempt log with status code 0 — and no raw
+    // field value leaks into the log.
+    @IsTest
+    static void locallyInvalidRequestFailsWithoutCalloutButLogs() {
+        Integration_Transmission__c t = contactlessRow();
+        EchoSuccessMock mock = new EchoSuccessMock(SUCCESS_UUID);
+        Test.setMock(HttpCalloutMock.class, mock);
+
+        Test.startTest();
+        new AttorneySendQueueable(mapOf(t, t.Claim_Token__c), new List<Id>()).execute(null);
+        Test.stopTest();
+
+        System.assertEquals(false, mock.wasCalled, 'a locally-invalid request makes no HTTP callout');
+
+        Integration_Transmission__c after = [
+            SELECT Status__c, Last_Error_Code__c, Last_Status_Code__c
+            FROM Integration_Transmission__c WHERE Id = :t.Id
+        ];
+        System.assertEquals('Failed', after.Status__c);
+        System.assertEquals('INVALID_REQUEST', after.Last_Error_Code__c);
+
+        Integration_Log__c log = logsForReferral(t.Referral__c)[0];
+        System.assertEquals(false, log.Success__c);
+        System.assertEquals(0, log.Status_Code__c, 'no HTTP response -> status code 0');
+        System.assertEquals('INVALID_REQUEST', log.Error_Message__c);
+        System.assert(log.Sanitized_Request_JSON__c.contains('invalidRequest'),
+            'the request log records only the failed check, no values: ' + log.Sanitized_Request_JSON__c);
+    }
+
     // Best-effort logging must INSPECT, not ignore: one bad log row does not throw and does not take the
-    // valid rows down with it, and its failure surfaces as controlled status codes only.
+    // valid rows down with it, and its failure surfaces as a CONTROLLED status code (never the raw value).
     @IsTest
     static void logInsertFailureIsInspectedNotSwallowed() {
         String goodCorrelation = 'abababab-cdcd-4ede-8f0f-121212121212';
@@ -346,7 +391,8 @@ private class AttorneySendQueueableTest {
             new List<Integration_Log__c>{ good, bad });
 
         System.assertEquals(1, failures.size(), 'the one bad row is inspected, not discarded');
-        System.assert(String.isNotBlank(failures[0]), 'failure reported as a controlled status code: ' + failures[0]);
+        System.assertEquals('INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST', failures[0], 'controlled status code only');
+        System.assertEquals(false, failures[0].contains('Bogus'), 'the rejected value never appears in the diagnostic');
         System.assertEquals(1, [SELECT COUNT() FROM Integration_Log__c WHERE Correlation_Id__c = :goodCorrelation],
             'the valid row survives the bad one');
     }

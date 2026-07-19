@@ -14,8 +14,10 @@
  *      DURING the callout is refused). Persist with genuine partial success and reclassify a #4 success
  *      that collides on External_Record_Key__c as #7b — NEVER throwing, so one bad row cannot roll back
  *      the others' committed results.
- *   5. Write one attempt log per callout, BEST-EFFORT (Database.insert(..., false)) — a rejected log must
- *      never roll back the state machine — with the log's classification taken AFTER local persistence.
+ *   5. Write one log per AUTHORIZED SEND ATTEMPT — including an attempt the API service rejects LOCALLY
+ *      (INVALID_REQUEST) before any HTTP request, which still applies a permanent failure and logs with
+ *      status code 0 — BEST-EFFORT (Database.insert(..., false), inspected) so a rejected log never rolls
+ *      back the state machine, with the log's classification taken AFTER local persistence.
  *   6. Enqueue one next dispatcher for the leftover candidates.
  *
  * At-least-once delivery: a refused (stale) row was still delivered to Attorney; its request is not
