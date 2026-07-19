@@ -277,4 +277,321 @@ private class AttorneyTransmissionServiceTest {
             AttorneyTransmissionService.errorCodes(new List<Database.Error>())
         );
     }
+
+    // ---- #4–#8: apply a send outcome ---------------------------------------
+    //
+    // These produce REAL CalloutOutcomes via AttorneyApiService.sendReferral + a mock — never a
+    // fabricated one (its constructor is private on purpose). A mock callout still counts as a callout
+    // and cannot follow DML, so every test produces its outcome(s) FIRST, then does its DML.
+
+    private static final String CASE_UUID = '11111111-2222-4333-8444-555555555555';
+    private static final String CASE_RECORD_ID = 'a00000000000001AAA';
+    private static final String CORRELATION = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    private static final String CLAIM_TOKEN = 'cccccccc-dddd-4eee-8fff-999999999999';
+
+    private class Mock implements HttpCalloutMock {
+        private Integer status; private String body;
+        private Mock(Integer status, String body) { this.status = status; this.body = body; }
+        public HttpResponse respond(HttpRequest req) {
+            HttpResponse r = new HttpResponse();
+            r.setStatusCode(status);
+            r.setHeader('Content-Type', 'application/json');
+            if (body != null) { r.setBody(body); }
+            return r;
+        }
+    }
+
+    private static AttorneyReferralRequest validRequest() {
+        AttorneyReferralRequest r = new AttorneyReferralRequest();
+        r.correlationId = CORRELATION;
+        r.careConnectReferralId = 'a01000000000001AAA';
+        r.referralType = 'Personal Injury';
+        r.client = new AttorneyReferralRequest.ClientInfo();
+        r.client.careConnectContactId = '003000000000001AAA';
+        r.client.fullName = 'Jane Doe';
+        return r;
+    }
+
+    private static AttorneyApiService.CalloutOutcome outcome(Integer status, String body) {
+        Test.setMock(HttpCalloutMock.class, new Mock(status, body));
+        return AttorneyApiService.sendReferral(validRequest());
+    }
+    private static AttorneyApiService.CalloutOutcome successOutcome() {
+        return outcome(200, JSON.serialize(new Map<String, Object>{
+            'correlationId' => CORRELATION, 'success' => true, 'attorneyCaseId' => CASE_UUID,
+            'attorneyCaseRecordId' => CASE_RECORD_ID, 'status' => 'Open', 'errorCode' => null
+        }));
+    }
+    private static AttorneyApiService.CalloutOutcome transientOutcome() { return outcome(500, '{}'); } // SERVER_ERROR
+    private static AttorneyApiService.CalloutOutcome permanentOutcome() { return outcome(400, '{}'); } // VALIDATION_REJECTED
+
+    // A persisted Processing row with a given Retry_Count and an in-flight claim, one minute in.
+    private static Integration_Transmission__c processing(Integer retryCount) {
+        Referral__c r = insertReferrals(1)[0];
+        Datetime aMinuteAgo = Datetime.now().addMinutes(-1);
+        Integration_Transmission__c t = new Integration_Transmission__c(
+            Referral__c = r.Id, Target_System__c = 'ATTORNEY', Operation__c = 'CREATE_REFERRAL',
+            Transmission_Key__c = String.valueOf(r.Id) + '|ATTORNEY|CREATE_REFERRAL',
+            Correlation_Id__c = Uuid.v4(), Status__c = 'Processing', Retry_Count__c = retryCount,
+            Claim_Token__c = CLAIM_TOKEN,
+            Processing_Started_At__c = aMinuteAgo, Last_Attempt_At__c = aMinuteAgo
+        );
+        insert t;
+        return t;
+    }
+
+    private static Integration_Transmission__c reload(Id id) {
+        return [
+            SELECT Status__c, Retry_Count__c, Next_Retry_At__c, Last_Attempt_At__c, Processing_Started_At__c,
+                   Claim_Token__c, Last_Status_Code__c, Last_Error_Code__c, External_Record_Id__c,
+                   External_Record_Key__c, External_Salesforce_Id__c, Succeeded_At__c
+            FROM Integration_Transmission__c WHERE Id = :id
+        ];
+    }
+
+    @IsTest
+    static void successAppliesTransition4() {
+        AttorneyApiService.CalloutOutcome o = successOutcome(); // callout FIRST (before DML)
+        System.assertEquals(AttorneyApiService.Disposition.SUCCESS, o.disposition);
+
+        Integration_Transmission__c t = processing(0);
+        AttorneyTransmissionService.ApplyResult ar = AttorneyTransmissionService.applySendOutcome(t, o, CLAIM_TOKEN);
+        System.assertEquals(true, ar.applied);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Succeeded', after.Status__c);
+        System.assertEquals(CASE_UUID, after.External_Record_Id__c);
+        System.assertEquals('ATTORNEY|' + CASE_UUID, after.External_Record_Key__c);
+        System.assertEquals(CASE_RECORD_ID, after.External_Salesforce_Id__c);
+        System.assertEquals(200, after.Last_Status_Code__c);
+        System.assertNotEquals(null, after.Succeeded_At__c);
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Processing_Started_At__c);
+        System.assertEquals(null, after.Next_Retry_At__c);
+        System.assertEquals(null, after.Last_Error_Code__c);
+        System.assertNotEquals(null, after.Last_Attempt_At__c, 'Last_Attempt_At is durable, never cleared');
+    }
+
+    @IsTest
+    static void transientWithBudgetAppliesTransition5() {
+        AttorneyApiService.CalloutOutcome o = transientOutcome();
+        System.assertEquals(AttorneyApiService.Disposition.TRANSIENT_FAILURE, o.disposition);
+
+        Integration_Transmission__c t = processing(1); // one retry performed; budget remains
+        System.assertEquals(true, AttorneyTransmissionService.applySendOutcome(t, o, CLAIM_TOKEN).applied);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Retry Scheduled', after.Status__c);
+        System.assertEquals('SERVER_ERROR', after.Last_Error_Code__c);
+        System.assertEquals(1, after.Retry_Count__c, 'applySendOutcome never touches Retry_Count (the CLAIM does)');
+        System.assertNotEquals(null, after.Next_Retry_At__c);
+        System.assert(after.Next_Retry_At__c > after.Last_Attempt_At__c, 'retry is scheduled in the future');
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Processing_Started_At__c);
+    }
+
+    @IsTest
+    static void transientNoBudgetAppliesTransition6() {
+        AttorneyApiService.CalloutOutcome o = transientOutcome();
+
+        Integration_Transmission__c t = processing(3); // MAX_RETRIES retries performed; budget spent
+        System.assertEquals(true, AttorneyTransmissionService.applySendOutcome(t, o, CLAIM_TOKEN).applied);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Failed', after.Status__c);
+        System.assertEquals('RETRY_BUDGET_EXHAUSTED', after.Last_Error_Code__c);
+        System.assertEquals(null, after.Next_Retry_At__c);
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Processing_Started_At__c);
+    }
+
+    @IsTest
+    static void permanentAppliesTransition7() {
+        AttorneyApiService.CalloutOutcome o = permanentOutcome();
+        System.assertEquals(AttorneyApiService.Disposition.PERMANENT_FAILURE, o.disposition);
+
+        Integration_Transmission__c t = processing(0);
+        System.assertEquals(true, AttorneyTransmissionService.applySendOutcome(t, o, CLAIM_TOKEN).applied);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Failed', after.Status__c);
+        System.assertEquals('VALIDATION_REJECTED', after.Last_Error_Code__c, 'the outcome error code, not a budget code');
+        System.assertEquals(400, after.Last_Status_Code__c);
+        System.assertEquals(null, after.Next_Retry_At__c);
+        System.assertEquals(null, after.Claim_Token__c);
+    }
+
+    @IsTest
+    static void backoffGrowsWithRetryCount() {
+        // Both callouts first (no DML between a callout and the next), then the DML rows.
+        AttorneyApiService.CalloutOutcome o0 = transientOutcome();
+        AttorneyApiService.CalloutOutcome o2 = transientOutcome();
+
+        Integration_Transmission__c t0 = processing(0);
+        AttorneyTransmissionService.applySendOutcome(t0, o0, CLAIM_TOKEN);
+        System.assertEquals(t0.Last_Attempt_At__c.addMinutes(1), t0.Next_Retry_At__c, 'Retry_Count 0 -> +1 min');
+
+        Integration_Transmission__c t2 = processing(2);
+        AttorneyTransmissionService.applySendOutcome(t2, o2, CLAIM_TOKEN);
+        System.assertEquals(t2.Last_Attempt_At__c.addMinutes(4), t2.Next_Retry_At__c, 'Retry_Count 2 -> +4 min');
+    }
+
+    // The real two-stage in-memory sequence the sender runs when a #4 success DML collides on the
+    // unique External_Record_Key__c: apply the genuine success (which sets Succeeded_At + the external
+    // ids), THEN reclassify as #7b — proving #7b actually CLEARS what the success set.
+    @IsTest
+    static void externalConflictReclassifiesAnAppliedSuccess() {
+        AttorneyApiService.CalloutOutcome success = successOutcome(); // callout before DML
+
+        Integration_Transmission__c t = processing(0);
+        System.assertEquals(true, AttorneyTransmissionService.applySendOutcome(t, success, CLAIM_TOKEN).applied);
+        System.assertNotEquals(null, t.Succeeded_At__c, 'success set Succeeded_At...');
+        System.assertNotEquals(null, t.External_Record_Key__c, '...and the external key');
+        System.assertEquals(200, t.Last_Status_Code__c);
+
+        // ...but the unique-key write collided; the caller reclassifies the same in-memory row:
+        AttorneyTransmissionService.applyExternalConflict(t);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Failed', after.Status__c);
+        System.assertEquals('EXTERNAL_RECORD_CONFLICT', after.Last_Error_Code__c);
+        System.assertEquals(null, after.External_Record_Id__c, 'conflicting identifiers must NOT be persisted');
+        System.assertEquals(null, after.External_Record_Key__c);
+        System.assertEquals(null, after.External_Salesforce_Id__c);
+        System.assertEquals(null, after.Succeeded_At__c, '#7b clears the Succeeded_At the success had set');
+        System.assertEquals(200, after.Last_Status_Code__c, 'the successful HTTP status stays for diagnostics');
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Next_Retry_At__c);
+    }
+
+    @IsTest
+    static void staleWithBudgetAppliesTransition8a() {
+        Integration_Transmission__c t = processing(1); // Processing_Started_At = one minute ago
+        AttorneyTransmissionService.ApplyResult ar = AttorneyTransmissionService.applyStaleRecovery(t, Datetime.now());
+        System.assertEquals(true, ar.applied);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Retry Scheduled', after.Status__c);
+        System.assertEquals('STALE_CLAIM_RECOVERED', after.Last_Error_Code__c);
+        System.assertNotEquals(null, after.Next_Retry_At__c, 'recovered row is immediately eligible');
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Processing_Started_At__c);
+    }
+
+    @IsTest
+    static void staleNoBudgetAppliesTransition8b() {
+        Integration_Transmission__c t = processing(3);
+        System.assertEquals(true, AttorneyTransmissionService.applyStaleRecovery(t, Datetime.now()).applied);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Failed', after.Status__c);
+        System.assertEquals('RETRY_BUDGET_EXHAUSTED', after.Last_Error_Code__c,
+            'a repeatedly-dying sender terminates once the budget is spent');
+        System.assertEquals(null, after.Next_Retry_At__c);
+        System.assertEquals(null, after.Claim_Token__c);
+    }
+
+    // ---- authorization: a stale/mismatched sender must NOT write ------------
+
+    // The load-bearing race the spec describes: a recovery re-claims the row with a new token WHILE an
+    // old sender is mid-callout. When that old sender returns, its outcome must be refused, not applied.
+    @IsTest
+    static void mismatchedTokenIsRefusedAndMutatesNothing() {
+        AttorneyApiService.CalloutOutcome o = successOutcome();
+
+        Integration_Transmission__c t = processing(0); // current token is CLAIM_TOKEN
+        AttorneyTransmissionService.ApplyResult ar =
+            AttorneyTransmissionService.applySendOutcome(t, o, 'dddddddd-eeee-4fff-8000-111111111111');
+
+        System.assertEquals(false, ar.applied);
+        System.assertEquals('stale-claim', ar.reason);
+        System.assertEquals('Processing', t.Status__c, 'the row is untouched');
+        System.assertEquals(CLAIM_TOKEN, t.Claim_Token__c, 'the newer token is NOT cleared');
+        System.assertEquals(null, t.Succeeded_At__c);
+        System.assertEquals(null, t.External_Record_Key__c);
+        // "mutates nothing" means the WHOLE row, not just the success fields:
+        System.assertEquals(null, t.Last_Status_Code__c);
+        System.assertEquals(null, t.Last_Error_Code__c);
+        System.assertEquals(null, t.Next_Retry_At__c);
+        System.assertNotEquals(null, t.Processing_Started_At__c, 'the in-flight marker is left intact');
+    }
+
+    // Pins the exact Apex footgun applySendOutcome is written to avoid: Apex `==` on String is
+    // case-INSENSITIVE; the authorization check uses .equals() so a token differing only by case is
+    // refused. This test fails if a future edit swaps .equals() back to ==.
+    @IsTest
+    static void tokenComparisonIsCaseSensitive() {
+        AttorneyApiService.CalloutOutcome o = successOutcome();
+
+        Integration_Transmission__c t = processing(0);
+        String differentlyCasedToken = CLAIM_TOKEN.toUpperCase();
+        System.assertNotEquals(CLAIM_TOKEN, differentlyCasedToken, 'the cased token must differ');
+
+        AttorneyTransmissionService.ApplyResult ar =
+            AttorneyTransmissionService.applySendOutcome(t, o, differentlyCasedToken);
+
+        System.assertEquals(false, ar.applied, 'a token matching only case-insensitively must be refused');
+        System.assertEquals('stale-claim', ar.reason);
+        System.assertEquals('Processing', t.Status__c);
+        System.assertEquals(CLAIM_TOKEN, t.Claim_Token__c);
+        System.assertEquals(null, t.Last_Status_Code__c);
+        System.assertEquals(null, t.Succeeded_At__c);
+        System.assertEquals(null, t.External_Record_Key__c);
+    }
+
+    @IsTest
+    static void blankExpectedTokenIsRefused() {
+        AttorneyApiService.CalloutOutcome o = successOutcome();
+
+        Integration_Transmission__c t = processing(0);
+        AttorneyTransmissionService.ApplyResult ar = AttorneyTransmissionService.applySendOutcome(t, o, '');
+
+        System.assertEquals(false, ar.applied);
+        System.assertEquals('no-expected-token', ar.reason);
+        System.assertEquals('Processing', t.Status__c, 'the row is untouched');
+    }
+
+    // A row that has already moved past Processing (a duplicate/late sender) cannot receive an outcome,
+    // even if the caller happens to present the token that used to be current.
+    @IsTest
+    static void nonProcessingRowIsRefused() {
+        AttorneyApiService.CalloutOutcome o = successOutcome();
+
+        for (String terminal : new List<String>{ 'Succeeded', 'Failed', 'Retry Scheduled' }) {
+            Integration_Transmission__c t = processing(0);
+            t.Status__c = terminal;
+            AttorneyTransmissionService.ApplyResult ar =
+                AttorneyTransmissionService.applySendOutcome(t, o, CLAIM_TOKEN);
+            System.assertEquals(false, ar.applied, terminal + ' must not accept a send outcome');
+            System.assertEquals('stale-claim', ar.reason);
+            System.assertEquals(terminal, t.Status__c, terminal + ' row is untouched');
+        }
+    }
+
+    @IsTest
+    static void staleRecoveryRefusesANonStaleOrNonProcessingRow() {
+        // still Processing but NOT yet past the cutoff (Processing_Started_At = one minute ago)
+        Integration_Transmission__c fresh = processing(1);
+        AttorneyTransmissionService.ApplyResult notStale =
+            AttorneyTransmissionService.applyStaleRecovery(fresh, Datetime.now().addMinutes(-5));
+        System.assertEquals(false, notStale.applied);
+        System.assertEquals('not-stale', notStale.reason);
+        System.assertEquals('Processing', fresh.Status__c, 'untouched');
+
+        // already completed by a live sender between the sweep's SELECT and this write
+        Integration_Transmission__c done = processing(1);
+        done.Status__c = 'Succeeded';
+        AttorneyTransmissionService.ApplyResult notProcessing =
+            AttorneyTransmissionService.applyStaleRecovery(done, Datetime.now());
+        System.assertEquals(false, notProcessing.applied);
+        System.assertEquals('not-processing', notProcessing.reason);
+        System.assertEquals('Succeeded', done.Status__c, 'untouched');
+    }
 }
