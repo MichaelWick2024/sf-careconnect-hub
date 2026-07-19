@@ -612,10 +612,17 @@ A **bounded `Schedulable`** (Batch Apex is for far larger datasets) using **one 
 
 ```sql
 SELECT Id, Status__c, Retry_Count__c FROM Integration_Transmission__c
-WHERE (Status__c = 'Pending')
-   OR (Status__c = 'Retry Scheduled' AND Next_Retry_At__c <= :sweepTime)
-   OR (Status__c = 'Processing'      AND Processing_Started_At__c < :staleCutoff)
+WHERE Target_System__c = 'ATTORNEY' AND Operation__c = 'CREATE_REFERRAL'
+  AND ( (Status__c = 'Pending')
+     OR (Status__c = 'Retry Scheduled' AND Next_Retry_At__c <= :sweepTime)
+     OR (Status__c = 'Processing'      AND Processing_Started_At__c < :staleCutoff) )
 ```
+
+The query is **Attorney-scoped**: `enqueueRoot` and the dispatcher/sender route checks already prevent a
+Provider row from being *sent* to Attorney, but an unscoped query could still fill the 200-candidate root
+budget with Provider rows the dispatcher would only reject — needlessly displacing eligible Attorney
+work. The runtime route checks remain as defense in depth; the filter keeps irrelevant rows out of the
+Attorney sweep's capacity. (Provider gets its own scoped sweep; `enqueueRoot` stays generic.)
 
 The sweep's `SELECT` is only a **snapshot**; the precise rules are applied against **freshly-locked**
 state. Structure:
@@ -650,10 +657,11 @@ is spent.
 
 `claim()` refuses a due `Retry Scheduled` row at the ceiling (`Retry_Count >= MAX_RETRIES`), but no send
 transition moves it to `Failed`, so it could sit `Retry Scheduled` forever. `applyExhaustedRetryRepair`
-closes that gap: on a **freshly-locked** row that is still `Retry Scheduled` **and** at/over the ceiling
-it writes `Failed` / `RETRY_BUDGET_EXHAUSTED` (clearing `Next_Retry_At`, `Claim_Token`,
-`Processing_Started_At`), returning a controlled `ApplyResult`. It is **not** a send attempt — no
-callout, no attempt log.
+closes that gap: on a **freshly-locked** row that is still `Retry Scheduled`, at/over the ceiling, **and
+actually due** (`Next_Retry_At__c != null && Next_Retry_At__c <= sweepTime`) it writes `Failed` /
+`RETRY_BUDGET_EXHAUSTED` (clearing `Next_Retry_At`, `Claim_Token`, `Processing_Started_At`), returning a
+controlled `ApplyResult`. A future-dated or null-retry-time row is **refused**, untouched. It is **not** a
+send attempt — no callout, no attempt log.
 
 ## Backoff
 
