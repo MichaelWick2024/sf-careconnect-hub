@@ -38,8 +38,10 @@ public with sharing class AttorneyReferralRequestMapper {
         return r;
     }
 
-    // Explicit ISO-8601 yyyy-MM-dd. Date.format()/String.valueOf(Date) are locale-dependent; the
-    // Attorney contract (and its validator's ^\d{4}-\d{2}-\d{2}$ check) require this exact shape.
+    // Explicitly constructs the Attorney contract's yyyy-MM-dd shape. Date.format() is locale-dependent;
+    // building the wire format here (rather than relying on String.valueOf(Date)) keeps the zero-padding
+    // and the external contract visible and independently testable, matching the validator's
+    // ^\d{4}-\d{2}-\d{2}$ check.
     private static String isoDate(Date d) {
         if (d == null) {
             return null;
