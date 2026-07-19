@@ -433,11 +433,51 @@ private class AttorneyTransmissionServiceTest {
 
         Integration_Transmission__c t0 = processing(0);
         AttorneyTransmissionService.applySendOutcome(t0, o0, CLAIM_TOKEN);
-        System.assertEquals(t0.Last_Attempt_At__c.addMinutes(1), t0.Next_Retry_At__c, 'Retry_Count 0 -> +1 min');
+        System.assertEquals(t0.Last_Attempt_At__c.addMinutes(60), t0.Next_Retry_At__c, 'Retry_Count 0 -> +60 min');
 
         Integration_Transmission__c t2 = processing(2);
         AttorneyTransmissionService.applySendOutcome(t2, o2, CLAIM_TOKEN);
-        System.assertEquals(t2.Last_Attempt_At__c.addMinutes(4), t2.Next_Retry_At__c, 'Retry_Count 2 -> +4 min');
+        System.assertEquals(t2.Last_Attempt_At__c.addMinutes(240), t2.Next_Retry_At__c, 'Retry_Count 2 -> +240 min (60*2^2)');
+    }
+
+    // ---- exhausted-retry repair (the stranded Retry Scheduled ceiling row) --
+
+    @IsTest
+    static void exhaustedRetryScheduledRowIsRepairedToFailed() {
+        Integration_Transmission__c t = processing(3); // at the ceiling
+        t.Status__c = 'Retry Scheduled';
+        t.Next_Retry_At__c = Datetime.now().addMinutes(-1); // due, but unclaimable at the ceiling
+        update t;
+
+        AttorneyTransmissionService.ApplyResult ar = AttorneyTransmissionService.applyExhaustedRetryRepair(t);
+        System.assertEquals(true, ar.applied);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Failed', after.Status__c);
+        System.assertEquals('RETRY_BUDGET_EXHAUSTED', after.Last_Error_Code__c);
+        System.assertEquals(null, after.Next_Retry_At__c);
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Processing_Started_At__c);
+    }
+
+    @IsTest
+    static void retryRepairRefusesRowsWithBudgetLeftOrWrongStatus() {
+        // still has budget -> not a stranded row
+        Integration_Transmission__c withBudget = processing(1);
+        withBudget.Status__c = 'Retry Scheduled';
+        update withBudget;
+        AttorneyTransmissionService.ApplyResult r1 = AttorneyTransmissionService.applyExhaustedRetryRepair(withBudget);
+        System.assertEquals(false, r1.applied);
+        System.assertEquals('not-eligible', r1.reason);
+        System.assertEquals('Retry Scheduled', withBudget.Status__c, 'untouched');
+
+        // at the ceiling but NOT Retry Scheduled (e.g. still Processing) -> not this repair's job
+        Integration_Transmission__c processingAtCeiling = processing(3);
+        AttorneyTransmissionService.ApplyResult r2 = AttorneyTransmissionService.applyExhaustedRetryRepair(processingAtCeiling);
+        System.assertEquals(false, r2.applied);
+        System.assertEquals('not-eligible', r2.reason);
+        System.assertEquals('Processing', processingAtCeiling.Status__c, 'untouched');
     }
 
     // The real two-stage in-memory sequence the sender runs when a #4 success DML collides on the

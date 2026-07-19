@@ -46,9 +46,12 @@ public with sharing class AttorneyTransmissionService {
     private static final String TARGET_CODE = TARGET; // 'ATTORNEY'
 
     // Backoff (transition #5): Next_Retry_At = Last_Attempt_At + BASE * 2^Retry_Count, capped.
-    // BASE = 1 min -> retries at ~+1m, +2m, +4m. Constants live here; custom metadata later.
-    @TestVisible private static final Integer BASE_BACKOFF_MINUTES = 1;
-    @TestVisible private static final Integer MAX_BACKOFF_MINUTES = 60;
+    // BASE = 60 min -> retries become DUE at ~+1h, +2h, +4h. This is sized to the recovery sweep, which
+    // is scheduled HOURLY (a single Scheduled Apex job cannot run more than once per hour), so a shorter
+    // base could only mark a row due sooner than the sweep can ever pick it up. The cap must exceed the
+    // largest scheduled backoff (60 * 2^(MAX_RETRIES-1) = 240) or it would flatten the schedule.
+    @TestVisible private static final Integer BASE_BACKOFF_MINUTES = 60;
+    @TestVisible private static final Integer MAX_BACKOFF_MINUTES = 240;
 
     // Status API values (restricted picklist).
     private static final String PENDING = 'Pending';
@@ -376,6 +379,27 @@ public with sharing class AttorneyTransmissionService {
             clearInFlight(t);
             t.Next_Retry_At__c = null;
         }
+        return new ApplyResult(true, null);
+    }
+
+    /**
+     * Defensive invariant repair — NOT a send attempt, and not a stale recovery. A due Retry Scheduled
+     * row whose Retry_Count has reached MAX_RETRIES can never be claimed (claim() refuses it at the
+     * ceiling), yet no send transition moves it to Failed — so without this it would sit Retry Scheduled
+     * forever. The recovery sweep calls this on a freshly-locked row to close that gap.
+     *
+     * AUTHORIZATION: writes ONLY a row still Retry Scheduled AND at/over the retry ceiling; otherwise the
+     * row is left UNTOUCHED and ApplyResult.reason is 'not-eligible'. It makes no callout and writes no
+     * attempt log (the sweep never manufactures a send result that did not happen).
+     */
+    public static ApplyResult applyExhaustedRetryRepair(Integration_Transmission__c t) {
+        if (t.Status__c != RETRY_SCHEDULED || retryCount(t) < MAX_RETRIES) {
+            return new ApplyResult(false, 'not-eligible');
+        }
+        t.Status__c = FAILED;
+        t.Last_Error_Code__c = RETRY_BUDGET_EXHAUSTED;
+        t.Next_Retry_At__c = null;
+        clearInFlight(t);
         return new ApplyResult(true, null);
     }
 

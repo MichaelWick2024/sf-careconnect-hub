@@ -19,10 +19,62 @@ public with sharing class AttorneyDispatchQueueable implements Queueable {
 
     @TestVisible private static final Integer MAX_CLAIM_BATCH = 3;
 
+    // A single root drains at most MAX_ROOT_CANDIDATES referrals, worst-case 2 * ceil(N / MAX_CLAIM_BATCH)
+    // chain links (a dispatcher + a sender per batch). MAX_CHAIN_DEPTH must cover that; the relationship
+    // is pinned by AttorneyDispatchQueueableTest and 140 is verified accepted by the org.
+    @TestVisible private static final Integer MAX_ROOT_CANDIDATES = 200;
+    @TestVisible private static final Integer MAX_CHAIN_DEPTH = 140;
+
     private final List<Id> candidateIds;
 
     public AttorneyDispatchQueueable(List<Id> candidateIds) {
         this.candidateIds = candidateIds == null ? new List<Id>() : candidateIds;
+    }
+
+    /**
+     * The single entry point for STARTING a chain — used by BOTH the trigger and the scheduled sweep, so
+     * every root sets the same explicit MaximumQueueableStackDepth via AsyncOptions. A root that skipped
+     * it would begin an unconfigured chain (hasMaxStackDepth() = false) with no depth protection.
+     * Chained dispatcher/sender enqueues use ordinary System.enqueueJob and inherit this maximum.
+     *
+     * Returns null for null/empty input; dedups; caps at MAX_ROOT_CANDIDATES; and enqueues only when the
+     * transaction still has Queueable capacity — otherwise it returns null and leaves the work Pending
+     * for the sweep (the safety net), rather than throwing. The payload carries ONLY transmission ids,
+     * never status / correlation ids / other record data.
+     */
+    public static Id enqueueRoot(List<Id> candidateIds) {
+        List<Id> normalized = normalizeRootCandidates(candidateIds);
+        if (normalized.isEmpty()) {
+            return null;
+        }
+        if (Limits.getQueueableJobs() >= Limits.getLimitQueueableJobs()) {
+            return null; // no capacity this transaction — the sweep will resurface the Pending rows
+        }
+        AsyncOptions options = new AsyncOptions();
+        options.MaximumQueueableStackDepth = MAX_CHAIN_DEPTH;
+        return System.enqueueJob(new AttorneyDispatchQueueable(normalized), options);
+    }
+
+    // Dedups (order-preserving), drops nulls, and caps at MAX_ROOT_CANDIDATES. Split out so the
+    // normalization is unit-testable without enqueuing.
+    @TestVisible
+    private static List<Id> normalizeRootCandidates(List<Id> candidateIds) {
+        List<Id> normalized = new List<Id>();
+        if (candidateIds == null) {
+            return normalized;
+        }
+        Set<Id> seen = new Set<Id>();
+        for (Id candidateId : candidateIds) {
+            if (candidateId == null || seen.contains(candidateId)) {
+                continue;
+            }
+            seen.add(candidateId);
+            normalized.add(candidateId);
+            if (normalized.size() == MAX_ROOT_CANDIDATES) {
+                break;
+            }
+        }
+        return normalized;
     }
 
     public void execute(QueueableContext ctx) {

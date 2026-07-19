@@ -81,6 +81,45 @@ private class AttorneyDispatchQueueableTest {
         System.assertEquals(1, countByStatus('Pending'), 'the leftover candidate is carried, not claimed here');
     }
 
+    // ---- root enqueue ------------------------------------------------------
+
+    @IsTest
+    static void depthCeilingCanDrainOneFullRoot() {
+        Integer requiredDepth = 2 * ((AttorneyDispatchQueueable.MAX_ROOT_CANDIDATES
+            + AttorneyDispatchQueueable.MAX_CLAIM_BATCH - 1) / AttorneyDispatchQueueable.MAX_CLAIM_BATCH);
+        System.assert(
+            AttorneyDispatchQueueable.MAX_CHAIN_DEPTH >= requiredDepth,
+            'The configured root depth (' + AttorneyDispatchQueueable.MAX_CHAIN_DEPTH
+            + ') must be able to drain one bounded root (' + requiredDepth + ')');
+    }
+
+    @IsTest
+    static void normalizeDedupsDropsNullsAndCaps() {
+        // dedup + null drop, order preserved
+        List<Id> ids = pendingTransmissionIds(3);
+        List<Id> withDupesAndNull = new List<Id>{ ids[0], ids[1], ids[0], null, ids[2], ids[1] };
+        List<Id> normalized = AttorneyDispatchQueueable.normalizeRootCandidates(withDupesAndNull);
+        System.assertEquals(new List<Id>{ ids[0], ids[1], ids[2] }, normalized);
+
+        // null / empty -> empty
+        System.assertEquals(0, AttorneyDispatchQueueable.normalizeRootCandidates(null).size());
+        System.assertEquals(0, AttorneyDispatchQueueable.normalizeRootCandidates(new List<Id>()).size());
+    }
+
+    @IsTest
+    static void enqueueRootRefusesEmptyAndStartsChainForValid() {
+        System.assertEquals(null, AttorneyDispatchQueueable.enqueueRoot(null), 'null -> no job');
+        System.assertEquals(null, AttorneyDispatchQueueable.enqueueRoot(new List<Id>()), 'empty -> no job');
+
+        List<Id> ids = pendingTransmissionIds(2);
+        Test.startTest();
+        Id jobId = AttorneyDispatchQueueable.enqueueRoot(ids);
+        Test.stopTest(); // runs the enqueued root dispatcher
+
+        System.assertNotEquals(null, jobId, 'a valid root returns a job id');
+        System.assertEquals(2, countByStatus('Processing'), 'the root actually started the chain and claimed');
+    }
+
     @IsTest
     static void emptyCandidatesIsNoOp() {
         new AttorneyDispatchQueueable(new List<Id>()).execute(null);

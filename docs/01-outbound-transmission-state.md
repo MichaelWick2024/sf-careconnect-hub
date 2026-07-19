@@ -2,7 +2,7 @@
 
 > **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
 > **Audience** Salesforce developers building or maintaining Care Connect outbound.
-> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, `AttorneyReferralRequestMapper`, and `AttorneyTransmissionService` (create/claim **#1–#3** plus the **#4–#8b outcome-application methods** `applySendOutcome`/`applyExternalConflict`/`applyStaleRecovery`) — exists (see Build status below). All transition *logic* is a synchronous, unit-tested layer, and the **serial Queueable chain** (`AttorneyDispatchQueueable` → `AttorneySendQueueable`) now invokes the send transitions #4–#7b end to end, with the post-callout `FOR UPDATE` re-lock and token-gated application. The **trigger (enqueue on new referrals) and the scheduled recovery sweep (#8) are not built yet** and remain gated on this specification.
+> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, `AttorneyReferralRequestMapper`, and `AttorneyTransmissionService` (create/claim **#1–#3** plus the **#4–#8b outcome-application methods** `applySendOutcome`/`applyExternalConflict`/`applyStaleRecovery`) — exists (see Build status below). All transition *logic* is a synchronous, unit-tested layer (including #11 exhausted-retry repair), and the **serial Queueable chain** (`AttorneyDispatchQueueable` → `AttorneySendQueueable`) invokes the send transitions #4–#7b end to end, with the post-callout `FOR UPDATE` re-lock and token-gated application. The shared root-enqueue (`AttorneyDispatchQueueable.enqueueRoot`, `MaximumQueueableStackDepth`) and the `Referral__c.Ready_For_Attorney__c` eligibility signal exist. The **trigger (enqueues the first root on eligible referrals) and the scheduled recovery sweep (#8 / #11) are not built yet** and remain gated on this specification.
 > **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`.
 > **Owner** Care Connect integration team.
 > **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Transmission_Support` (read-only), `permissionsets/Integration_Transmission_Runtime` (execution path). `Integration_Admin` deliberately does **not** cover this object.
@@ -246,6 +246,7 @@ focused diagnostic (`Target_System__c` ATTORNEY/PROVIDER, `Operation__c` CREATE_
 | 8b | Processing *(stale)* **and `Retry_Count >= MAX_RETRIES`** | recovery sweep | **Failed** | `Last_Error_Code = RETRY_BUDGET_EXHAUSTED`; clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`. **Not returned to the loop.** |
 | 9 | Failed | manual retry | **Retry Scheduled** | `Retry_Count = 0`; `Next_Retry_At = now`; clear `Last_Error_Code`. **`Correlation_Id` unchanged** |
 | 10 | Succeeded | — | *terminal* | No transition out. Ever. |
+| 11 | Retry Scheduled *(due, `Retry_Count >= MAX_RETRIES`)* | recovery sweep (`applyExhaustedRetryRepair`) | **Failed** | `Last_Error_Code = RETRY_BUDGET_EXHAUSTED`; clear `Next_Retry_At`, `Claim_Token`, `Processing_Started_At`. Defensive repair of a row `claim()` refuses but nothing else fails; **not a send attempt** |
 
 ### Invariants
 
@@ -567,38 +568,100 @@ constraint — the sender's per-transaction cumulative callout budget: `3 × 30 
    enqueues use ordinary `System.enqueueJob` and inherit the maximum. When work is dropped at the
    ceiling, the scheduled sweep resurfaces it — no transmission is lost, only deferred.
 
+### Trigger eligibility and root enqueue
+
+**Eligibility is an explicit business signal**, `Referral__c.Ready_For_Attorney__c` (checkbox, default
+false) — not a `Status__c` value. `Status = New` could submit an incomplete referral; `Sent to Attorney`
+is an outcome, not a request. The trigger qualifies a referral only when it is **inserted with
+`Ready_For_Attorney__c = true`** or **changes `false → true`**. This signal is the business decision to
+submit; it does **not** duplicate request validation — `AttorneyReferralRequestValidator` remains the
+final technical contract guard. The trigger does **not** update `Status__c` (that is not this design's
+concern; `Integration_Transmission__c` is the source of truth for delivery state).
+
+**The static guard governs only the ROOT ENQUEUE, not transmission creation.** A trigger can fire
+several times in one transaction; every firing must still `createReferralTransmissions` for its newly
+eligible ids (else those referrals never get a transmission and the sweep cannot find them), but at
+most one root may be enqueued. So each firing: (1) find newly eligible ids → (2)
+`createReferralTransmissions` → (3) attempt `enqueueRoot` **only if** the transaction has not already
+enqueued a root, setting the static boolean **only after a successful enqueue**. If there is no
+Queueable capacity, leave the transmissions `Pending`; the sweep is the safety net.
+
+A Queueable serialized during the **first** firing cannot gain transmission ids created by **later**
+firings — those later transmissions stay `Pending` and are picked up by the hourly sweep. This is
+documented and tested behavior, not a claim that the first root contains every transmission created
+anywhere in the transaction.
+
+**`AttorneyDispatchQueueable.enqueueRoot(List<Id>)`** is that shared root-enqueue (used by the trigger
+AND the sweep): returns null for null/empty, dedups, caps at `MAX_ROOT_CANDIDATES = 200`, enqueues only
+with Queueable capacity (else null, leaving work for the sweep), sets `MaximumQueueableStackDepth =
+MAX_CHAIN_DEPTH` (140, verified accepted by the org; `≥ 2 × ⌈200/3⌉ = 134`, pinned by test), and carries
+**only transmission ids** — never status, correlation ids, or other record data.
+
 The scheduled sweeper is the safety net and the uniform path for retries and stale recovery.
 
 ## Recovery sweep
 
-A scheduled job — **not** a chained Queueable — drives:
+A scheduled job — **not** a chained Queueable — is the safety net and the uniform path for retries and
+stale recovery. **Cadence: hourly.** A single Scheduled Apex job cannot run more than once per hour, so
+the backoff is sized to that (below); a faster production design would stagger several hourly schedules
+at different minute offsets, which this training phase deliberately does not add.
+
+A **bounded `Schedulable`** (Batch Apex is for far larger datasets) using **one captured time**
+(`sweepTime = Datetime.now()`, `staleCutoff = sweepTime - STALE_AFTER_MINUTES`, `STALE_AFTER_MINUTES = 15`):
 
 ```sql
 SELECT Id, Status__c, Retry_Count__c FROM Integration_Transmission__c
 WHERE (Status__c = 'Pending')
-   OR (Status__c = 'Retry Scheduled' AND Next_Retry_At__c <= :now)
+   OR (Status__c = 'Retry Scheduled' AND Next_Retry_At__c <= :sweepTime)
    OR (Status__c = 'Processing'      AND Processing_Started_At__c < :staleCutoff)
 ```
 
-The sweep only *finds* candidates; the claim transaction (with `FOR UPDATE`) applies the precise
-rules. In particular, `Retry_Count__c` is selected so each candidate can be routed:
+The sweep's `SELECT` is only a **snapshot**; the precise rules are applied against **freshly-locked**
+state. Structure:
 
-- **Pending** → claim (#2).
-- **Retry Scheduled**, due → claim if `Retry_Count < MAX_RETRIES` (#3), else it is a budget-spent row
-  that should already be Failed; treat defensively.
-- **Processing**, stale → **#8a** if `Retry_Count < MAX_RETRIES`, else **#8b** (`Failed`,
-  `RETRY_BUDGET_EXHAUSTED`). **This budget check is what bounds a repeatedly-dying sender.**
+1. Find stale `Processing` rows (bounded by `MAX_STALE_RECOVERIES_PER_SWEEP = 100` — singular re-locking
+   is one SOQL per candidate, kept under the async SOQL limit).
+2. **Re-lock each singularly** (`WHERE Id = :id FOR UPDATE`) and call `applyStaleRecovery(row, staleCutoff)` —
+   which re-verifies `Processing` **and** still-stale before writing (**#8a** if `Retry_Count < MAX_RETRIES`,
+   else **#8b** `Failed`/`RETRY_BUDGET_EXHAUSTED` — the budget check that bounds a repeatedly-dying sender).
+3. Persist with partial DML (`Database.update(rows, false)`) and **inspect every `SaveResult`** (safe
+   status codes only, never throw-rollback).
+4. Add only **successfully-committed #8a** rows to the root candidates. **#8b rows are terminal — never
+   enqueued.**
+5. Query `Pending` and due `Retry Scheduled` rows to fill the remaining root capacity
+   (`MAX_ROOT_CANDIDATES = 200`). A due `Retry Scheduled` row at the ceiling
+   (`Retry_Count >= MAX_RETRIES`) is repaired to `Failed` via `applyExhaustedRetryRepair` (**#11**),
+   not enqueued — closing the gap where such a row would otherwise sit `Retry Scheduled` forever.
+6. Call **`AttorneyDispatchQueueable.enqueueRoot(candidates)` once** (the shared root-enqueue that sets
+   `MaximumQueueableStackDepth`).
 
-Scheduled Apex rather than chained Queueables because it (a) is not bound by the Queueable delay cap,
-so real exponential backoff is possible, and (b) reclaims stranded `Processing` rows. Chained
-Queueables can do neither — and a Queueable that dies from an uncatchable limit exception leaves a row
-stranded in `Processing`: without #8b it would be recovered forever; with #8b it fails after the
-budget is spent.
+**The sweep performs no new send attempt, so it writes NO `Integration_Log__c` attempt row.** A stale
+`Processing` record cannot prove whether its earlier HTTP request left Salesforce before the job died;
+the sweep changes only transmission state (`STALE_CLAIM_RECOVERED` / `RETRY_BUDGET_EXHAUSTED`) and never
+synthesizes a callout result that never existed.
+
+Scheduled Apex rather than chained Queueables because it (a) reclaims stranded `Processing` rows and
+(b) is the durable heartbeat. A Queueable that dies from an uncatchable limit exception leaves a row
+stranded in `Processing`: without #8b it would be recovered forever; with #8b it fails after the budget
+is spent.
+
+## Transition #11 — exhausted-retry repair (defensive invariant)
+
+`claim()` refuses a due `Retry Scheduled` row at the ceiling (`Retry_Count >= MAX_RETRIES`), but no send
+transition moves it to `Failed`, so it could sit `Retry Scheduled` forever. `applyExhaustedRetryRepair`
+closes that gap: on a **freshly-locked** row that is still `Retry Scheduled` **and** at/over the ceiling
+it writes `Failed` / `RETRY_BUDGET_EXHAUSTED` (clearing `Next_Retry_At`, `Claim_Token`,
+`Processing_Started_At`), returning a controlled `ApplyResult`. It is **not** a send attempt — no
+callout, no attempt log.
 
 ## Backoff
 
 `Next_Retry_At = Last_Attempt_At + BASE * 2^Retry_Count`, capped at `MAX_BACKOFF`.
-With `BASE = 1 min`: retries at ~+1m, +2m, +4m. Constants live in one place; custom metadata later.
+**`BASE = 60 min`** → retries become **due** at ~+1h, +2h, +4h (cap `MAX_BACKOFF = 240 min`, which must
+exceed the largest scheduled backoff or it would flatten the schedule). The base is sized to the hourly
+sweep: a shorter base could only mark a row due sooner than the sweep can ever pick it up, so combined
+with `STALE_AFTER = 15 min` the **actual** recovery latency is roughly **15–75 minutes**. Constants live
+in one place; custom metadata later.
 
 ## Live authentication configuration (split across orgs)
 
@@ -628,19 +691,21 @@ and the platform injects auth. Tests use `HttpCalloutMock` and need none of this
   — merged (PR #5)
 - ✅ `AttorneyTransmissionService` — **transitions #1–#3** (create-or-get + `FOR UPDATE` claim) + tests — merged (PR #6)
 - ✅ `AttorneyTransmissionService` — **#4–#8b outcome application** (`applySendOutcome` #4–#7, `applyExternalConflict` #7b, `applyStaleRecovery` #8a/#8b) + backoff, and `AttorneyReferralRequestMapper` (`Referral__c`/`Contact` → request DTO) + tests — merged (PR #7)
-- ✅ the serial Queueable chain — `AttorneyDispatchQueueable` (loops singular claim over `MAX_CLAIM_BATCH = 3`, enqueues one sender, carries leftover) → `AttorneySendQueueable` (all callouts first, post-callout `FOR UPDATE` re-lock, token-gated `applySendOutcome` #4–#7b, one `Integration_Log__c` per attempt, enqueues one next dispatcher) + `AttorneyApiService.TIMEOUT_MS = 30 s` + tests — in-flight (PR #8)
+- ✅ the serial Queueable chain — `AttorneyDispatchQueueable` (loops singular claim over `MAX_CLAIM_BATCH = 3`, enqueues one sender, carries leftover) → `AttorneySendQueueable` (all callouts first, post-callout `FOR UPDATE` re-lock, token-gated `applySendOutcome` #4–#7b, one `Integration_Log__c` per attempt, enqueues one next dispatcher) + `AttorneyApiService.TIMEOUT_MS = 30 s` + tests — merged (PR #8)
+- ✅ recovery foundations — `Referral__c.Ready_For_Attorney__c` eligibility signal; `AttorneyDispatchQueueable.enqueueRoot` (dedup + cap `MAX_ROOT_CANDIDATES = 200` + `MaximumQueueableStackDepth = MAX_CHAIN_DEPTH = 140`); `AttorneyTransmissionService.applyExhaustedRetryRepair` (#11); backoff sized to the hourly sweep (`BASE = 60 min`, cap 240) + tests — in-flight (PR #9)
 
 **Still to build — this document is the contract for it:**
 
-- ⏳ the trigger + handler eligibility (enqueues the FIRST dispatcher, guarded by a transaction-level
-  static) · the scheduled retry / stale-processing recovery sweep (re-locks and invokes
-  `applyStaleRecovery` #8) · the live Named Credential / Connected App config (see *Live authentication
+- ⏳ the trigger + handler eligibility (creates transmissions for newly-`Ready_For_Attorney__c` referrals
+  every firing; enqueues at most ONE root via `enqueueRoot`, guarded by a transaction-level static) ·
+  the scheduled hourly recovery sweep (re-locks and invokes `applyStaleRecovery` #8 / `applyExhaustedRetryRepair`
+  #11, then `enqueueRoot`) · the live Named Credential / Connected App config (see *Live authentication
   configuration* above)
 
-Every transition #1–#8b is executable and unit-tested (`AttorneyTransmissionService`), and the
-send chain (`AttorneyDispatchQueueable` → `AttorneySendQueueable`) drives #4–#7b end to end. What
-remains is the trigger that starts the chain on new referrals and the scheduled sweep that drives
-retries and stale recovery (#8).
+Every transition #1–#8b and #11 is executable and unit-tested (`AttorneyTransmissionService`), the send
+chain drives #4–#7b end to end, and the shared root-enqueue + eligibility signal exist. What remains is
+the trigger that starts the chain on eligible referrals and the scheduled sweep that drives retries and
+stale recovery.
 
 ## Tests this specification demands
 
