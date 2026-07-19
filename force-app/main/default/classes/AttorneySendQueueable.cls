@@ -56,9 +56,11 @@ public with sharing class AttorneySendQueueable implements Queueable, Database.A
     private void processClaimedGroup(List<Integration_Log__c> logs) {
         Set<Id> ids = claimTokenById.keySet();
 
-        // 1. Reload with the pre-callout auth fields (Status/Claim_Token) and the mapper's fields.
+        // 1. Reload with the pre-callout auth fields (Status/Claim_Token), the route fields, and the
+        // mapper's fields.
         Map<Id, Integration_Transmission__c> ctxById = new Map<Id, Integration_Transmission__c>([
-            SELECT Id, Status__c, Claim_Token__c, Correlation_Id__c, Referral__c, Retry_Count__c,
+            SELECT Id, Status__c, Claim_Token__c, Target_System__c, Operation__c, Correlation_Id__c,
+                   Referral__c, Retry_Count__c,
                    Referral__r.Referral_Type__c, Referral__r.Contact__c,
                    Referral__r.Contact__r.Id, Referral__r.Contact__r.Name, Referral__r.Contact__r.Email,
                    Referral__r.Contact__r.Phone, Referral__r.Contact__r.Birthdate
@@ -72,6 +74,12 @@ public with sharing class AttorneySendQueueable implements Queueable, Database.A
         for (Id id : ids) {
             Integration_Transmission__c t = ctxById.get(id);
             if (t == null) {
+                continue;
+            }
+            // Defense in depth: the dispatcher only claims Attorney rows, but never send a row through
+            // the Attorney endpoint unless it IS one — a wrong-target row gets no callout and no log.
+            if (t.Target_System__c != AttorneyTransmissionService.TARGET
+                    || t.Operation__c != AttorneyTransmissionService.OPERATION) {
                 continue;
             }
             String expected = claimTokenById.get(id);

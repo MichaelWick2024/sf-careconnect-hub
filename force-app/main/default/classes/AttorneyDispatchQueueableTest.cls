@@ -120,6 +120,30 @@ private class AttorneyDispatchQueueableTest {
         System.assertEquals(2, countByStatus('Processing'), 'the root actually started the chain and claimed');
     }
 
+    // A Provider transmission handed to the ATTORNEY dispatcher (e.g. by a future generic sweep) must
+    // never enter the Attorney chain: the route-gated claim refuses it, so it stays Pending, unclaimed,
+    // with no token — and the dispatcher enqueues no sender for it (hence no callout, no log downstream).
+    @IsTest
+    static void providerRowIsNotClaimedByTheAttorneyDispatcher() {
+        Referral__c r = new Referral__c(Status__c = 'New');
+        insert r;
+        Integration_Transmission__c provider = new Integration_Transmission__c(
+            Referral__c = r.Id, Target_System__c = 'PROVIDER', Operation__c = 'CREATE_REFERRAL',
+            Transmission_Key__c = String.valueOf(r.Id) + '|PROVIDER|CREATE_REFERRAL',
+            Correlation_Id__c = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', Status__c = 'Pending', Retry_Count__c = 0);
+        insert provider;
+
+        Test.startTest();
+        new AttorneyDispatchQueueable(new List<Id>{ provider.Id }).execute(null);
+        Test.stopTest();
+
+        Integration_Transmission__c after = [
+            SELECT Status__c, Claim_Token__c FROM Integration_Transmission__c WHERE Id = :provider.Id
+        ];
+        System.assertEquals('Pending', after.Status__c, 'a Provider row must not be claimed by Attorney');
+        System.assertEquals(null, after.Claim_Token__c);
+    }
+
     @IsTest
     static void emptyCandidatesIsNoOp() {
         new AttorneyDispatchQueueable(new List<Id>()).execute(null);

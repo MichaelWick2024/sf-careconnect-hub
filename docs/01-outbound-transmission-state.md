@@ -321,8 +321,9 @@ if (transmission.Status__c == 'Pending') {   // two jobs can both read Pending
    one job capable of claiming.
 2. Verify `Status = Pending`, or `Status = Retry Scheduled AND Next_Retry_At <= now AND
    Retry_Count < MAX_RETRIES`. Otherwise **exit silently** — someone else won, or the budget is
-   already spent; both are normal outcomes, not errors. (A due row at the ceiling is not claimed
-   here; the sweep's #8b path fails it instead.)
+   already spent; both are normal outcomes, not errors. (A due row at the ceiling is not claimed here;
+   the sweep's **#11** `applyExhaustedRetryRepair` fails it instead — #8b applies only to stale
+   `Processing`, not a due `Retry Scheduled` row.)
 3. `Status = Processing`; `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`;
    `Last_Attempt_At = now`; increment `Retry_Count` if claiming from Retry Scheduled.
 4. Enqueue the callout job with **transmission Id + claim token**.
@@ -701,6 +702,12 @@ and the platform injects auth. Tests use `HttpCalloutMock` and need none of this
   the scheduled hourly recovery sweep (re-locks and invokes `applyStaleRecovery` #8 / `applyExhaustedRetryRepair`
   #11, then `enqueueRoot`) · the live Named Credential / Connected App config (see *Live authentication
   configuration* above)
+- ⏳ transition **#9 — manual retry** (`Failed` → `Retry Scheduled`, `Retry_Count = 0`) is specified but
+  **deferred to a later hardening phase**: it needs a controlled admin action/service, not an ad-hoc edit.
+  **`Ready_For_Attorney__c` is NOT the retry mechanism** — it is the one-time *initial* eligibility event;
+  re-checking it does not move an existing `Failed` transmission back to `Retry Scheduled` (`claim()`
+  correctly refuses `Failed`), it only resolves the forever-unique `Transmission_Key__c` row that already
+  exists. Manual retry is a deliberate, separate control.
 
 Every transition #1–#8b and #11 is executable and unit-tested (`AttorneyTransmissionService`), the send
 chain drives #4–#7b end to end, and the shared root-enqueue + eligibility signal exist. What remains is

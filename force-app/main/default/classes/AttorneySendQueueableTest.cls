@@ -122,7 +122,7 @@ private class AttorneySendQueueableTest {
         Referral__c r = new Referral__c(Status__c = 'New', Referral_Type__c = referralType, Contact__c = contactId);
         insert r;
         Integration_Transmission__c t = AttorneyTransmissionService.createReferralTransmissions(new Set<Id>{ r.Id })[0];
-        AttorneyTransmissionService.claim(t.Id);
+        AttorneyTransmissionService.claim(t.Id, 'ATTORNEY', 'CREATE_REFERRAL');
     }
 
     private static Integration_Transmission__c rowOfType(String referralType) {
@@ -373,6 +373,33 @@ private class AttorneySendQueueableTest {
         System.assertEquals('INVALID_REQUEST', log.Error_Message__c);
         System.assert(log.Sanitized_Request_JSON__c.contains('invalidRequest'),
             'the request log records only the failed check, no values: ' + log.Sanitized_Request_JSON__c);
+    }
+
+    // Defense in depth: even if a wrong-target row reached the sender (it should not — the dispatcher's
+    // claim is route-gated), the sender refuses to send it through the Attorney endpoint. No callout,
+    // no log, untouched. (No callout happens, so the row can be built in-method without @TestSetup.)
+    @IsTest
+    static void senderRefusesAWrongTargetRowWithNoCallout() {
+        Referral__c r = new Referral__c(Status__c = 'New', Referral_Type__c = 'Personal Injury');
+        insert r;
+        Integration_Transmission__c provider = new Integration_Transmission__c(
+            Referral__c = r.Id, Target_System__c = 'PROVIDER', Operation__c = 'CREATE_REFERRAL',
+            Transmission_Key__c = String.valueOf(r.Id) + '|PROVIDER|CREATE_REFERRAL',
+            Correlation_Id__c = Uuid.v4(), Status__c = 'Processing', Retry_Count__c = 0,
+            Claim_Token__c = 'cccccccc-dddd-4eee-8fff-999999999999');
+        insert provider;
+        EchoSuccessMock mock = new EchoSuccessMock(SUCCESS_UUID);
+        Test.setMock(HttpCalloutMock.class, mock);
+
+        Test.startTest();
+        new AttorneySendQueueable(
+            new Map<Id, String>{ provider.Id => provider.Claim_Token__c }, new List<Id>()).execute(null);
+        Test.stopTest();
+
+        System.assertEquals(false, mock.wasCalled, 'a wrong-target row is never sent through the Attorney endpoint');
+        System.assertEquals(0, [SELECT COUNT() FROM Integration_Log__c], 'no attempt, no log');
+        System.assertEquals('Processing',
+            [SELECT Status__c FROM Integration_Transmission__c WHERE Id = :provider.Id].Status__c, 'untouched');
     }
 
     // Best-effort logging must INSPECT, not ignore: one bad log row does not throw and does not take the

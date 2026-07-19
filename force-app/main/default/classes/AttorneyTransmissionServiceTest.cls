@@ -165,7 +165,7 @@ private class AttorneyTransmissionServiceTest {
         Integration_Transmission__c t = onePending();
 
         Test.startTest();
-        AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(t.Id);
+        AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(t.Id, 'ATTORNEY', 'CREATE_REFERRAL');
         Test.stopTest();
 
         System.assertEquals(true, cr.claimed);
@@ -187,8 +187,8 @@ private class AttorneyTransmissionServiceTest {
         Integration_Transmission__c a = onePending();
         Integration_Transmission__c b = onePending();
 
-        AttorneyTransmissionService.ClaimResult ca = AttorneyTransmissionService.claim(a.Id);
-        AttorneyTransmissionService.ClaimResult cb = AttorneyTransmissionService.claim(b.Id);
+        AttorneyTransmissionService.ClaimResult ca = AttorneyTransmissionService.claim(a.Id, 'ATTORNEY', 'CREATE_REFERRAL');
+        AttorneyTransmissionService.ClaimResult cb = AttorneyTransmissionService.claim(b.Id, 'ATTORNEY', 'CREATE_REFERRAL');
 
         System.assertEquals(true, ca.claimed);
         System.assertEquals(true, cb.claimed);
@@ -197,7 +197,7 @@ private class AttorneyTransmissionServiceTest {
 
     @IsTest
     static void nullIdReturnsNotFound() {
-        System.assertEquals('not-found', AttorneyTransmissionService.claim((Id) null).reason);
+        System.assertEquals('not-found', AttorneyTransmissionService.claim((Id) null, 'ATTORNEY', 'CREATE_REFERRAL').reason);
     }
 
     @IsTest
@@ -205,7 +205,7 @@ private class AttorneyTransmissionServiceTest {
         Integration_Transmission__c t = onePending();
         Id id = t.Id;
         delete t; // a well-formed id that no longer resolves to a row
-        AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(id);
+        AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(id, 'ATTORNEY', 'CREATE_REFERRAL');
         System.assertEquals(false, cr.claimed);
         System.assertEquals('not-found', cr.reason);
     }
@@ -226,7 +226,7 @@ private class AttorneyTransmissionServiceTest {
         Integration_Transmission__c t = retryScheduled(Datetime.now().addMinutes(-1), 1);
 
         Test.startTest();
-        AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(t.Id);
+        AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(t.Id, 'ATTORNEY', 'CREATE_REFERRAL');
         Test.stopTest();
 
         System.assertEquals(true, cr.claimed);
@@ -241,7 +241,7 @@ private class AttorneyTransmissionServiceTest {
     @IsTest
     static void doesNotClaimRetryNotYetDue() {
         Integration_Transmission__c t = retryScheduled(Datetime.now().addMinutes(30), 1);
-        AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(t.Id);
+        AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(t.Id, 'ATTORNEY', 'CREATE_REFERRAL');
         System.assertEquals(false, cr.claimed);
         System.assertEquals('not-eligible', cr.reason);
     }
@@ -249,7 +249,7 @@ private class AttorneyTransmissionServiceTest {
     @IsTest
     static void doesNotClaimRetryAtCeiling() {
         Integration_Transmission__c t = retryScheduled(Datetime.now().addMinutes(-1), AttorneyTransmissionService.MAX_RETRIES);
-        AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(t.Id);
+        AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(t.Id, 'ATTORNEY', 'CREATE_REFERRAL');
         System.assertEquals(false, cr.claimed);
         System.assertEquals('not-eligible', cr.reason);
     }
@@ -260,7 +260,7 @@ private class AttorneyTransmissionServiceTest {
             Integration_Transmission__c t = onePending();
             t.Status__c = state;
             update t;
-            AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(t.Id);
+            AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(t.Id, 'ATTORNEY', 'CREATE_REFERRAL');
             System.assertEquals(false, cr.claimed, state + ' must not be claimable');
             System.assertEquals('not-eligible', cr.reason);
         }
@@ -442,6 +442,36 @@ private class AttorneyTransmissionServiceTest {
 
     // ---- exhausted-retry repair (the stranded Retry Scheduled ceiling row) --
 
+    // ---- route boundary ----------------------------------------------------
+
+    private static Integration_Transmission__c oneProviderPending() {
+        Referral__c r = insertReferrals(1)[0];
+        Integration_Transmission__c t = new Integration_Transmission__c(
+            Referral__c = r.Id, Target_System__c = 'PROVIDER', Operation__c = 'CREATE_REFERRAL',
+            Transmission_Key__c = String.valueOf(r.Id) + '|PROVIDER|CREATE_REFERRAL',
+            Correlation_Id__c = Uuid.v4(), Status__c = 'Pending', Retry_Count__c = 0);
+        insert t;
+        return t;
+    }
+
+    // A shared-object row that belongs to a DIFFERENT target must be refused by the Attorney claim,
+    // even though it is otherwise perfectly claimable (Pending) — the route boundary comes first.
+    @IsTest
+    static void claimRefusesAWrongTargetRow() {
+        Integration_Transmission__c provider = oneProviderPending();
+
+        AttorneyTransmissionService.ClaimResult cr =
+            AttorneyTransmissionService.claim(provider.Id, 'ATTORNEY', 'CREATE_REFERRAL');
+
+        System.assertEquals(false, cr.claimed);
+        System.assertEquals('wrong-target', cr.reason);
+        Integration_Transmission__c after = [
+            SELECT Status__c, Claim_Token__c FROM Integration_Transmission__c WHERE Id = :provider.Id
+        ];
+        System.assertEquals('Pending', after.Status__c, 'the Provider row is untouched');
+        System.assertEquals(null, after.Claim_Token__c, 'no Attorney claim token was assigned');
+    }
+
     @IsTest
     static void exhaustedRetryScheduledRowIsRepairedToFailed() {
         Integration_Transmission__c t = processing(3); // at the ceiling
@@ -449,7 +479,7 @@ private class AttorneyTransmissionServiceTest {
         t.Next_Retry_At__c = Datetime.now().addMinutes(-1); // due, but unclaimable at the ceiling
         update t;
 
-        AttorneyTransmissionService.ApplyResult ar = AttorneyTransmissionService.applyExhaustedRetryRepair(t);
+        AttorneyTransmissionService.ApplyResult ar = AttorneyTransmissionService.applyExhaustedRetryRepair(t, Datetime.now());
         System.assertEquals(true, ar.applied);
         update t;
 
@@ -462,19 +492,43 @@ private class AttorneyTransmissionServiceTest {
     }
 
     @IsTest
+    static void retryRepairRefusesFutureOrNullRetryTime() {
+        Datetime sweepTime = Datetime.now();
+
+        // ceiling row, but not yet due (retry time in the future) -> refused, untouched
+        Integration_Transmission__c future = processing(3);
+        future.Status__c = 'Retry Scheduled';
+        future.Next_Retry_At__c = sweepTime.addMinutes(30);
+        update future;
+        AttorneyTransmissionService.ApplyResult r1 = AttorneyTransmissionService.applyExhaustedRetryRepair(future, sweepTime);
+        System.assertEquals(false, r1.applied, 'a not-yet-due ceiling row is not repaired');
+        System.assertEquals('not-eligible', r1.reason);
+        System.assertEquals('Retry Scheduled', future.Status__c);
+
+        // ceiling row with a null retry time -> refused (a different malformation, not #11's job)
+        Integration_Transmission__c noTime = processing(3);
+        noTime.Status__c = 'Retry Scheduled';
+        noTime.Next_Retry_At__c = null;
+        update noTime;
+        AttorneyTransmissionService.ApplyResult r2 = AttorneyTransmissionService.applyExhaustedRetryRepair(noTime, sweepTime);
+        System.assertEquals(false, r2.applied, 'a null retry time is not treated as due');
+        System.assertEquals('Retry Scheduled', noTime.Status__c);
+    }
+
+    @IsTest
     static void retryRepairRefusesRowsWithBudgetLeftOrWrongStatus() {
         // still has budget -> not a stranded row
         Integration_Transmission__c withBudget = processing(1);
         withBudget.Status__c = 'Retry Scheduled';
         update withBudget;
-        AttorneyTransmissionService.ApplyResult r1 = AttorneyTransmissionService.applyExhaustedRetryRepair(withBudget);
+        AttorneyTransmissionService.ApplyResult r1 = AttorneyTransmissionService.applyExhaustedRetryRepair(withBudget, Datetime.now());
         System.assertEquals(false, r1.applied);
         System.assertEquals('not-eligible', r1.reason);
         System.assertEquals('Retry Scheduled', withBudget.Status__c, 'untouched');
 
         // at the ceiling but NOT Retry Scheduled (e.g. still Processing) -> not this repair's job
         Integration_Transmission__c processingAtCeiling = processing(3);
-        AttorneyTransmissionService.ApplyResult r2 = AttorneyTransmissionService.applyExhaustedRetryRepair(processingAtCeiling);
+        AttorneyTransmissionService.ApplyResult r2 = AttorneyTransmissionService.applyExhaustedRetryRepair(processingAtCeiling, Datetime.now());
         System.assertEquals(false, r2.applied);
         System.assertEquals('not-eligible', r2.reason);
         System.assertEquals('Processing', processingAtCeiling.Status__c, 'untouched');

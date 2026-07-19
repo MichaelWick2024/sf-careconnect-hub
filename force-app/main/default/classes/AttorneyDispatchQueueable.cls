@@ -95,10 +95,13 @@ public with sharing class AttorneyDispatchQueueable implements Queueable {
             }
         }
 
-        // One singular FOR UPDATE claim per candidate; collect only the rows we actually won.
+        // One singular FOR UPDATE claim per candidate; collect only the rows we actually won. The claim
+        // is route-gated to Attorney's target/operation, so a Provider row handed here (e.g. by a future
+        // generic sweep) is refused `wrong-target` and never enters the Attorney chain.
         Map<Id, String> claimTokenById = new Map<Id, String>();
         for (Id candidateId : batch) {
-            AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(candidateId);
+            AttorneyTransmissionService.ClaimResult cr = AttorneyTransmissionService.claim(
+                candidateId, AttorneyTransmissionService.TARGET, AttorneyTransmissionService.OPERATION);
             if (cr.claimed) {
                 claimTokenById.put(cr.transmissionId, cr.claimToken);
             }

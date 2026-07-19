@@ -3,6 +3,7 @@
     <fullName>Ready_For_Attorney__c</fullName>
     <label>Ready For Attorney</label>
     <description>The business signal that a referral is complete and approved to send to the Attorney org. The outbound trigger qualifies a referral only on insert-with-true or a false-to-true change; it is NOT the technical contract guard (AttorneyReferralRequestValidator remains that). It does not represent delivery state — Integration_Transmission__c is the source of truth for that.</description>
+    <inlineHelpText>Marks the referral for its initial Attorney submission. This field does not represent delivery status and is not a manual-retry control: re-checking it does not resend an already-Failed transmission.</inlineHelpText>
     <type>Checkbox</type>
     <defaultValue>false</defaultValue>
 </CustomField>
