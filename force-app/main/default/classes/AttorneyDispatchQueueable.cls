@@ -74,9 +74,10 @@ public with sharing class AttorneyDispatchQueueable implements Queueable {
      * The chain's depth guard, shared with the sender. Salesforce caps chained Queueable depth (5 in
      * Developer/Trial orgs), and an enqueue that hits the ceiling throws AFTER this transaction's DML —
      * rolling back its committed state and logs. So we check BEFORE enqueuing and stop the chain
-     * cleanly, leaving remaining work for the scheduled sweep. PR #9's trigger sets an explicit
-     * MaximumQueueableStackDepth (via AsyncOptions) so the ceiling is a deliberate value, not the
-     * platform default.
+     * cleanly, leaving remaining work for the scheduled sweep. PR #9's shared root-enqueue method, used
+     * by BOTH the trigger and the scheduled sweep, sets an explicit MaximumQueueableStackDepth (via
+     * AsyncOptions) so the ceiling is a deliberate value, not the platform default — a root that skipped
+     * it would start an unconfigured chain with no protection.
      *
      * AsyncInfo is only callable inside a Queueable/Finalizer; a direct unit-test call to execute() is
      * not that context. That accommodation is made EXPLICIT (Test.isRunningTest) so that in production
