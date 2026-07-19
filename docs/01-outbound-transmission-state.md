@@ -512,7 +512,7 @@ Trigger transaction  (synchronous)
     │  enqueue ONCE  — guarded by a transaction-level static
     ▼
 Dispatcher / claimant  (async)
-    │  take a named, BOUNDED set of transmission ids (define MAX_CLAIM_BATCH)
+    │  take a named, BOUNDED set of transmission ids (MAX_CLAIM_BATCH = 3)
     │  call singular claim(Id) for each  — one WHERE Id = :id FOR UPDATE per call
     │  collect the successful {transmissionId, claimToken} pairs
     │  enqueue EXACTLY ONE sender
@@ -527,8 +527,9 @@ Dispatcher / claimant  …
 Claiming is **singular** (`AttorneyTransmissionService.claim(Id)`), not a batch `FOR UPDATE`, so a
 lock failure classifies **one** transmission as `locked` rather than the whole group. It still runs
 inside one dispatcher transaction, so a contested row can delay the dispatcher and locks already
-acquired stay held until the transaction ends — which is exactly why the batch must be **bounded**
-(the next PR defines `MAX_CLAIM_BATCH`; Salesforce lock guidance recommends smaller transactions).
+acquired stay held until the transaction ends — which is exactly why the batch is **bounded** at
+`MAX_CLAIM_BATCH = 3` (Salesforce lock guidance recommends smaller transactions, and — the binding
+constraint — the sender's per-transaction cumulative callout budget: `3 × 30 s = 90 s ≤ 120 s`).
 
 ### Normative rules
 
@@ -539,17 +540,28 @@ acquired stay held until the transaction ends — which is exactly why the batch
 2. **A dispatcher enqueues exactly one sender.** Never one per transmission.
 
 3. **A sender performs every callout before any DML.** A callout may not follow DML in the same
-   transaction, so a batched sender cannot call out → save → call out again. Either:
-   - **(a)** perform all callouts for the claimed group, holding results in memory, then persist once
-     — bounded by the 100-callout limit (use ~50 for headroom); or
-   - **(b)** process exactly one transmission per sender transaction.
+   transaction, so a batched sender cannot call out → save → call out again. **The implemented design:
+   perform all callouts for the claimed group (≤ `MAX_CLAIM_BATCH = 3`), holding results in memory,
+   then persist once.** The batch is bounded not by the 100-callout limit but by the tighter
+   **cumulative callout timeout** (120 s per transaction): `3 × 30 s = 90 s` leaves ~30 s of headroom.
 
-   **(a)** is more efficient; **(b)** has a smaller blast radius if the transaction dies after the
-   callouts but before the DML. Under (a) that strands the whole claimed group in `Processing`, and
-   every one of them has *already been delivered* — recovery will re-send them all. Attorney's
+   The tradeoff of batching over one-transmission-per-sender is blast radius: if the transaction dies
+   after the callouts but before the DML, the whole claimed group is stranded in `Processing`, and
+   every one has *already been delivered* — recovery re-sends them all. A batch of 3 keeps that radius
+   small. Attorney's
    idempotency absorbs it (see *Delivery guarantee*), but the tradeoff should be a deliberate choice.
 
 4. **A sender enqueues at most one next dispatcher**, only when work remains — this is the chain.
+
+5. **The chain respects a maximum stack depth.** Salesforce caps chained-Queueable depth (5 in
+   Developer/Trial orgs), and an enqueue that hits the ceiling throws **after** the transaction's DML —
+   rolling back its committed state and logs. So every link checks `System.AsyncInfo` **before**
+   enqueuing (`AttorneyDispatchQueueable.canEnqueueChild()`): the dispatcher checks **before claiming**
+   (claiming without the capacity to dispatch a sender would strand rows in `Processing`); the sender
+   checks before enqueuing the next dispatcher (its own results stay committed, the leftover goes to the
+   sweep). The **trigger** (next PR) sets an explicit `MaximumQueueableStackDepth` via `AsyncOptions`, so
+   the ceiling is a deliberate value rather than the platform default. When work is dropped at the
+   ceiling, the scheduled sweep resurfaces it — no transmission is lost, only deferred.
 
 The scheduled sweeper is the safety net and the uniform path for retries and stale recovery.
 

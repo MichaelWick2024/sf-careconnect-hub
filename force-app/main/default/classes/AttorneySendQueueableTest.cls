@@ -31,6 +31,17 @@ private class AttorneySendQueueableTest {
         }
     }
 
+    // Deletes the row WHILE the callout is in flight (system-context maintenance can do this), so the
+    // post-callout re-lock finds nothing.
+    private class DeleteRowMock implements HttpCalloutMock {
+        private Id transmissionId;
+        private DeleteRowMock(Id id) { this.transmissionId = id; }
+        public HttpResponse respond(HttpRequest req) {
+            delete new Integration_Transmission__c(Id = transmissionId);
+            return successFor(req, SUCCESS_UUID);
+        }
+    }
+
     // Per-row status keyed by correlationId — the three-row batch mock. 200 → success echo; else status.
     private class MultiMock implements HttpCalloutMock {
         private Map<String, Integer> statusByCorrelation;
@@ -298,6 +309,46 @@ private class AttorneySendQueueableTest {
         System.assertEquals(false, logsForReferral(mm.Referral__c)[0].Success__c);
         System.assertEquals('SERVER_ERROR', logsForReferral(mm.Referral__c)[0].Error_Message__c);
         System.assertEquals('VALIDATION_REJECTED', logsForReferral(gn.Referral__c)[0].Error_Message__c);
+    }
+
+    // A row deleted after its callout must not abort the batch: it gets a controlled NOT_FOUND log and
+    // the other rows (here, none) are unaffected — proving lockOne isolates a missing row.
+    @IsTest
+    static void missingRowAfterCalloutIsIsolatedNotFatal() {
+        Integration_Transmission__c t = rowOfType(PRIMARY_TYPE);
+        Id referralId = t.Referral__c;
+        Test.setMock(HttpCalloutMock.class, new DeleteRowMock(t.Id));
+
+        Test.startTest();
+        new AttorneySendQueueable(mapOf(t, t.Claim_Token__c), new List<Id>()).execute(null);
+        Test.stopTest();
+
+        System.assertEquals(0, [SELECT COUNT() FROM Integration_Transmission__c WHERE Id = :t.Id],
+            'the row was deleted mid-callout');
+        Integration_Log__c log = logsForReferral(referralId)[0];
+        System.assertEquals(false, log.Success__c);
+        System.assertEquals('NOT_FOUND', log.Error_Message__c, 'the attempt is logged, the batch not aborted');
+    }
+
+    // Best-effort logging must INSPECT, not ignore: one bad log row does not throw and does not take the
+    // valid rows down with it, and its failure surfaces as controlled status codes only.
+    @IsTest
+    static void logInsertFailureIsInspectedNotSwallowed() {
+        String goodCorrelation = 'abababab-cdcd-4ede-8f0f-121212121212';
+        Integration_Log__c good = new Integration_Log__c(
+            Direction__c = 'Outbound', External_System__c = 'Attorney', Http_Method__c = 'POST',
+            Correlation_Id__c = goodCorrelation, Status_Code__c = 200, Success__c = true);
+        Integration_Log__c bad = new Integration_Log__c(
+            Direction__c = 'Bogus', // restricted picklist -> rejected
+            External_System__c = 'Attorney', Http_Method__c = 'POST', Status_Code__c = 200);
+
+        List<String> failures = AttorneySendQueueable.writeLogsBestEffort(
+            new List<Integration_Log__c>{ good, bad });
+
+        System.assertEquals(1, failures.size(), 'the one bad row is inspected, not discarded');
+        System.assert(String.isNotBlank(failures[0]), 'failure reported as a controlled status code: ' + failures[0]);
+        System.assertEquals(1, [SELECT COUNT() FROM Integration_Log__c WHERE Correlation_Id__c = :goodCorrelation],
+            'the valid row survives the bad one');
     }
 
     private static Integration_Transmission__c reload(Id id) {

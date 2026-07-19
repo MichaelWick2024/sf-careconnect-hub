@@ -30,6 +30,7 @@ public with sharing class AttorneySendQueueable implements Queueable, Database.A
     // Log-only dispositions (Error_Message__c). Controlled vocabulary; never a remote or platform message.
     private static final String STALE_CLAIM = 'STALE_CLAIM';
     private static final String LOCKED = 'LOCKED';
+    private static final String NOT_FOUND = 'NOT_FOUND';
     private static final String HARD_DML_FAILURE = 'HARD_DML_FAILURE';
     private static final String EXTERNAL_RECORD_CONFLICT = 'EXTERNAL_RECORD_CONFLICT';
 
@@ -84,38 +85,56 @@ public with sharing class AttorneySendQueueable implements Queueable, Database.A
         List<Integration_Transmission__c> toUpdate = new List<Integration_Transmission__c>();
         for (Id id : outcomeById.keySet()) {
             AttorneyApiService.CalloutOutcome o = outcomeById.get(id);
-            Integration_Transmission__c row = lockOne(id);
-            if (row == null) {
-                logs.add(logRow(ctxById.get(id), o, false, LOCKED));
+            LockOutcome lock = lockOne(id);
+            if (lock.row == null) {
+                // 'locked' (contested) or 'not-found' (deleted post-callout) — both confined to this
+                // row; log the attempt (the callout happened) and leave the others to persist.
+                logs.add(logRow(ctxById.get(id), o, false, lock.reason == 'not-found' ? NOT_FOUND : LOCKED));
                 continue;
             }
             AttorneyTransmissionService.ApplyResult ar =
-                AttorneyTransmissionService.applySendOutcome(row, o, claimTokenById.get(id));
+                AttorneyTransmissionService.applySendOutcome(lock.row, o, claimTokenById.get(id));
             if (!ar.applied) {
                 logs.add(logRow(ctxById.get(id), o, false, STALE_CLAIM));
                 continue;
             }
-            toUpdate.add(row);
+            toUpdate.add(lock.row);
         }
 
         persistAndLog(toUpdate, outcomeById, ctxById, logs);
     }
 
-    // Singular FOR UPDATE. Returns null (not throwing) when the row is contested — UNABLE_TO_LOCK_ROW is
-    // a normal concurrency outcome confined to this one row.
-    private static Integration_Transmission__c lockOne(Id id) {
+    private class LockOutcome {
+        Integration_Transmission__c row; // null unless acquired
+        String reason;                   // 'locked' | 'not-found' when row is null
+    }
+
+    // Singular FOR UPDATE, isolated per row. A contested row (UNABLE_TO_LOCK_ROW) and a row deleted
+    // after the callout (empty result — verified: a list query does NOT throw on zero rows) are BOTH
+    // returned as controlled outcomes, never a thrown exception that would abort the rest of the batch
+    // after its remote requests already went out.
+    private static LockOutcome lockOne(Id id) {
+        LockOutcome lock = new LockOutcome();
+        List<Integration_Transmission__c> rows;
         try {
-            return [
+            rows = [
                 SELECT Id, Status__c, Claim_Token__c, Retry_Count__c, Last_Attempt_At__c
                 FROM Integration_Transmission__c WHERE Id = :id
                 FOR UPDATE
             ];
         } catch (System.QueryException qe) {
             if (isUnableToLock(qe)) {
-                return null;
+                lock.reason = 'locked';
+                return lock;
             }
             throw qe;
         }
+        if (rows.isEmpty()) {
+            lock.reason = 'not-found';
+            return lock;
+        }
+        lock.row = rows[0];
+        return lock;
     }
 
     // Persists the authorized rows with GENUINE partial success — no throw, no all-or-none DML — so a
@@ -153,34 +172,60 @@ public with sharing class AttorneySendQueueable implements Queueable, Database.A
             }
         }
         if (!conflicts.isEmpty()) {
-            Database.update(conflicts, false); // keys cleared -> cannot re-collide; still partial, no throw
-            for (Integration_Transmission__c row : conflicts) {
-                // Attorney returned 200, but the LOCAL result is a conflict: success=false, keep the
-                // useful HTTP status, record the controlled conflict code.
-                logs.add(logRow(ctxById.get(row.Id), outcomeById.get(row.Id), false, EXTERNAL_RECORD_CONFLICT));
+            // Keys were cleared, so this cannot re-collide — but a DIFFERENT failure is still possible,
+            // and the log must reflect what actually COMMITTED, not merely that we mutated the SObject.
+            List<Database.SaveResult> conflictResults = Database.update(conflicts, false);
+            for (Integer i = 0; i < conflictResults.size(); i++) {
+                Integration_Transmission__c row = conflicts[i];
+                AttorneyApiService.CalloutOutcome o = outcomeById.get(row.Id);
+                if (conflictResults[i].isSuccess()) {
+                    // Attorney returned 200 but the LOCAL result is a conflict: success=false, keep the
+                    // useful HTTP status, record the controlled conflict code.
+                    logs.add(logRow(ctxById.get(row.Id), o, false, EXTERNAL_RECORD_CONFLICT));
+                } else {
+                    // The #7b write itself failed — the DB row is still Processing, so the log must NOT
+                    // claim it became Failed. Leave it for stale recovery; log a hard failure.
+                    logs.add(logRow(ctxById.get(row.Id), o, false,
+                        HARD_DML_FAILURE + ':' + dmlCodes(conflictResults[i].getErrors())));
+                }
             }
         }
     }
 
-    private static void writeLogsBestEffort(List<Integration_Log__c> logs) {
+    // Best-effort: a rejected attempt log must NEVER roll back committed transmission state (the lesson
+    // the Attorney inbound logging service encodes). Partial insert, never throw — but INSPECT: a
+    // silently-discarded failure is the very invisibility this discipline exists to prevent. Failures
+    // are surfaced as controlled status codes only (never a remote/PII value). Returns those codes.
+    @TestVisible
+    private static List<String> writeLogsBestEffort(List<Integration_Log__c> logs) {
+        List<String> failureCodes = new List<String>();
         if (logs.isEmpty()) {
-            return;
+            return failureCodes;
         }
-        // Best-effort: a rejected attempt log must NEVER roll back committed transmission state (the
-        // lesson the Attorney inbound logging service already encodes). Partial insert, never throw.
-        Database.insert(logs, false);
+        List<Database.SaveResult> results = Database.insert(logs, false);
+        for (Integer i = 0; i < results.size(); i++) {
+            if (!results[i].isSuccess()) {
+                String codes = dmlCodes(results[i].getErrors());
+                failureCodes.add(codes);
+                System.debug(LoggingLevel.ERROR, 'Integration log insert failed. index=' + i + ', statusCodes=' + codes);
+            }
+        }
+        return failureCodes;
     }
 
     private void enqueueNextDispatcher() {
-        // Chaining a Queueable throws in test context (platform guard), so the enqueue is skipped there;
-        // tests drive execute() directly.
-        if (!leftover.isEmpty() && !Test.isRunningTest()) {
+        // Keep the chain draining — but only if we have committed our results AND the chain-depth policy
+        // allows another link. If it does not, our results stay committed and the leftover candidates are
+        // left for the scheduled sweep. Chaining throws in test context (platform guard), so the enqueue
+        // is skipped there; tests drive execute() directly.
+        if (!leftover.isEmpty() && AttorneyDispatchQueueable.canEnqueueChild() && !Test.isRunningTest()) {
             System.enqueueJob(new AttorneyDispatchQueueable(leftover));
         }
     }
 
-    // One attempt log, from the already value-safe CalloutOutcome. sanitizedRequest/sanitizedResponse
-    // are the outcome's allowlisted payloads (no PII, no raw body); errorCode is a controlled token.
+    // One attempt log, from the already value-safe CalloutOutcome. sanitizedRequest/sanitizedResponse are
+    // the outcome's allowlisted payloads — validated opaque identifiers and controlled fields, never the
+    // raw body; errorCode is a controlled token.
     private static Integration_Log__c logRow(
         Integration_Transmission__c ctx, AttorneyApiService.CalloutOutcome o, Boolean success, String errorCode
     ) {
@@ -217,6 +262,7 @@ public with sharing class AttorneySendQueueable implements Queueable, Database.A
         return true;
     }
 
+    @TestVisible
     private static String dmlCodes(List<Database.Error> errors) {
         if (errors == null || errors.isEmpty()) {
             return 'UNKNOWN';

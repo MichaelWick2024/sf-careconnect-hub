@@ -26,6 +26,13 @@ public with sharing class AttorneyDispatchQueueable implements Queueable {
     }
 
     public void execute(QueueableContext ctx) {
+        // Chain-depth policy: claim NOTHING if we could not enqueue the sender those claims require —
+        // claiming without the capacity to dispatch would strand rows in Processing until stale
+        // recovery. The candidates stay Pending and the scheduled sweep resurfaces them.
+        if (!canEnqueueChild()) {
+            return;
+        }
+
         List<Id> batch = new List<Id>();
         List<Id> leftover = new List<Id>();
         for (Integer i = 0; i < candidateIds.size(); i++) {
@@ -60,6 +67,27 @@ public with sharing class AttorneyDispatchQueueable implements Queueable {
 
         if (next != null && !Test.isRunningTest()) {
             System.enqueueJob(next);
+        }
+    }
+
+    /**
+     * The chain's depth guard, shared with the sender. Salesforce caps chained Queueable depth (5 in
+     * Developer/Trial orgs), and an enqueue that hits the ceiling throws AFTER this transaction's DML —
+     * rolling back its committed state and logs. So we check BEFORE enqueuing and stop the chain
+     * cleanly, leaving remaining work for the scheduled sweep. PR #9's trigger sets an explicit
+     * MaximumQueueableStackDepth (via AsyncOptions) so the ceiling is a deliberate value, not the
+     * platform default.
+     *
+     * AsyncInfo is only callable inside a Queueable/Finalizer; a direct unit-test call to execute() is
+     * not that context, so we treat the resulting AsyncException as "not depth-limited" and allow it.
+     */
+    public static Boolean canEnqueueChild() {
+        try {
+            return !System.AsyncInfo.hasMaxStackDepth()
+                || System.AsyncInfo.getCurrentQueueableStackDepth()
+                    < System.AsyncInfo.getMaximumQueueableStackDepth();
+        } catch (System.AsyncException e) {
+            return true; // not in a Queueable execution context (e.g. a direct unit-test call)
         }
     }
 }
