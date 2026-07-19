@@ -516,6 +516,34 @@ private class AttorneyTransmissionServiceTest {
         System.assertEquals(CLAIM_TOKEN, t.Claim_Token__c, 'the newer token is NOT cleared');
         System.assertEquals(null, t.Succeeded_At__c);
         System.assertEquals(null, t.External_Record_Key__c);
+        // "mutates nothing" means the WHOLE row, not just the success fields:
+        System.assertEquals(null, t.Last_Status_Code__c);
+        System.assertEquals(null, t.Last_Error_Code__c);
+        System.assertEquals(null, t.Next_Retry_At__c);
+        System.assertNotEquals(null, t.Processing_Started_At__c, 'the in-flight marker is left intact');
+    }
+
+    // Pins the exact Apex footgun applySendOutcome is written to avoid: Apex `==` on String is
+    // case-INSENSITIVE; the authorization check uses .equals() so a token differing only by case is
+    // refused. This test fails if a future edit swaps .equals() back to ==.
+    @IsTest
+    static void tokenComparisonIsCaseSensitive() {
+        AttorneyApiService.CalloutOutcome o = successOutcome();
+
+        Integration_Transmission__c t = processing(0);
+        String differentlyCasedToken = CLAIM_TOKEN.toUpperCase();
+        System.assertNotEquals(CLAIM_TOKEN, differentlyCasedToken, 'the cased token must differ');
+
+        AttorneyTransmissionService.ApplyResult ar =
+            AttorneyTransmissionService.applySendOutcome(t, o, differentlyCasedToken);
+
+        System.assertEquals(false, ar.applied, 'a token matching only case-insensitively must be refused');
+        System.assertEquals('stale-claim', ar.reason);
+        System.assertEquals('Processing', t.Status__c);
+        System.assertEquals(CLAIM_TOKEN, t.Claim_Token__c);
+        System.assertEquals(null, t.Last_Status_Code__c);
+        System.assertEquals(null, t.Succeeded_At__c);
+        System.assertEquals(null, t.External_Record_Key__c);
     }
 
     @IsTest

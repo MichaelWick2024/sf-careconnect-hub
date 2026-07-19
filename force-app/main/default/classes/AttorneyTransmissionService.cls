@@ -11,10 +11,12 @@
  * their callers own locking and persistence (a sender does every callout before any DML). This class
  * performs NO callouts.
  *
- * Authorization is enforced HERE, not left to Queueable convention. A callout can run up to the
- * per-attempt timeout, and during it the recovery sweep may declare the claim stale and re-claim the
- * row with a NEW token — so the pre-callout token check is only an early-exit optimization; the
- * authoritative check is AFTER the callouts, immediately before the write:
+ * The status-and-token authorization PREDICATE is enforced HERE rather than duplicated in Queueable
+ * code — but the caller remains responsible for passing a freshly-locked row (requery FOR UPDATE after
+ * the callouts) so the predicate is evaluated against CURRENT database state; this class cannot prove
+ * that on its own. A callout can run up to the per-attempt timeout, and during it the recovery sweep
+ * may declare the claim stale and re-claim the row with a NEW token — so the pre-callout token check is
+ * only an early-exit optimization; the authoritative check is AFTER the callouts, before the write:
  *   - applySendOutcome requires the sender's expected claim token and refuses to write a row that is
  *     no longer Processing or whose token has rotated;
  *   - applyStaleRecovery refuses a row that is not genuinely still stale.
@@ -255,7 +257,9 @@ public with sharing class AttorneyTransmissionService {
      * callouts). Otherwise the sender is stale: a recovery re-claimed the row with a new token while
      * this attempt was in flight, and overwriting would clobber the newer attempt and clear its token.
      * On refusal the row is left UNTOUCHED and ApplyResult.reason is 'stale-claim' (token mismatch or
-     * no longer Processing) or 'no-expected-token' (a caller programming error). Never throws.
+     * no longer Processing) or 'no-expected-token' (a caller programming error). An authorization
+     * refusal returns ApplyResult rather than throwing; a null transmission or outcome is a programming
+     * error that may still throw.
      *
      * Retry_Count is NOT incremented here — it increments on the next CLAIM (#3). This only READS it
      * to decide whether the budget is spent.
@@ -351,7 +355,8 @@ public with sharing class AttorneyTransmissionService {
      * (Processing_Started_At__c < staleCutoff) — the row `t` must be freshly locked (requeried FOR
      * UPDATE), because the sweep's earlier SELECT is a stale snapshot: a live sender may have completed
      * the row, or claimed it more recently, between that SELECT and this write. On refusal the row is
-     * left UNTOUCHED and ApplyResult.reason is 'not-processing' or 'not-stale'. Never throws.
+     * left UNTOUCHED and ApplyResult.reason is 'not-processing' or 'not-stale'. A refusal returns
+     * ApplyResult rather than throwing.
      */
     public static ApplyResult applyStaleRecovery(Integration_Transmission__c t, Datetime staleCutoff) {
         if (t.Status__c != PROCESSING) {
