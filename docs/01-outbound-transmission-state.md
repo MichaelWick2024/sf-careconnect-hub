@@ -330,26 +330,30 @@ if (transmission.Status__c == 'Pending') {   // two jobs can both read Pending
 > *"someone else is claiming it"* — a **normal outcome**. Catch it and exit cleanly. Do **not** let it
 > surface as a 500 or a failed transmission.
 
-**Transaction 2 — send** (`SendReferralToAttorneyQueueable`)
+**Transaction 2 — send** (`AttorneySendQueueable`) — for a claimed batch of up to `MAX_CLAIM_BATCH`:
 
-1. Reload the transmission.
-2. Confirm `Status = Processing` **and** the supplied claim token **matches**. Otherwise **exit
-   without sending** — this job is stale or duplicate. *(This pre-callout check is only an early-exit
-   optimization; it is not sufficient — see step 5.)*
-3. Build the request → **callout** → validate the response.
-4. **Re-lock and re-verify.** Requery the row **`FOR UPDATE`** and confirm `Status = Processing` **and**
-   the claim token **still matches**, immediately before the write. A callout can run up to the
-   per-attempt timeout, and during it the recovery sweep may declare the claim stale and re-claim the
-   row with a **new** token. The pre-callout check (step 2) cannot see that; this is the **authoritative**
-   check.
-5. Apply the outcome **only if authorized** (`applySendOutcome` enforces the token/status gate and
-   returns `applied = false, reason = 'stale-claim'` otherwise, leaving the row untouched) → write
-   **exactly one** attempt log. A refused row is not an error — it is the newer attempt correctly
-   winning; the stale sender's *request* already reached Attorney, and Attorney's idempotency absorbs
-   the duplicate (see *Delivery guarantee*).
+1. Reload the rows (with their auth fields + Referral/Contact fields).
+2. **Pre-callout authorization** (per row): send only if `Status = Processing` **and** the supplied
+   claim token **matches**. A row already detectably stale gets **no callout and no log** — no attempt
+   was made. *(This is only an early-exit optimization; it is not sufficient — see step 4.)*
+3. Build each request → **callout** → validate the response. All callouts happen before any DML.
+4. **Re-lock and re-verify, per row and SINGULARLY.** Requery each row with its own
+   `WHERE Id = :id FOR UPDATE` and confirm `Status = Processing` **and** the token **still matches**,
+   immediately before the write — the **authoritative** check (a callout can run up to the timeout, and
+   during it the sweep may re-claim the row with a new token). Locking is singular so one contested row
+   (`UNABLE_TO_LOCK_ROW`) does **not** fail the others; it is left `Processing` for recovery, and its
+   attempt is still logged because the callout occurred.
+5. Apply the outcome **only if authorized** (`applySendOutcome` enforces the token/status gate) and
+   persist with **genuine partial success** — no thrown exception, no all-or-none DML — so one row's
+   failure never rolls back another row's committed transition. A `DUPLICATE_VALUE` on a `Succeeded`
+   row is the #7b external-record collision. Then write attempt logs **best-effort**
+   (`Database.insert(logs, false)`) with each log's classification taken **after** local persistence
+   (a #7b logs `success = false`, status `200`, `EXTERNAL_RECORD_CONFLICT` — not the raw HTTP success).
+   Logging is best-effort and **must never roll back transmission state**; "one log per attempt" is the
+   intent, but Salesforce rejecting a log row cannot be allowed to undo the business transaction.
 
 This also satisfies the platform rule that a callout cannot follow DML in the same transaction: T1
-does the DML, T2 does SOQL → callout → SOQL(`FOR UPDATE`) → DML.
+does the DML, T2 does SOQL → callouts → SOQL(`FOR UPDATE`) → DML.
 
 The recovery sweep is subject to the **same discipline**: it must re-lock (`FOR UPDATE`) and
 re-evaluate `Processing_Started_At__c` before applying #8, because its candidate `SELECT` is a stale
