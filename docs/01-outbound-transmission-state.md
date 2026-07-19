@@ -2,7 +2,7 @@
 
 > **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
 > **Audience** Salesforce developers building or maintaining Care Connect outbound.
-> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, and `AttorneyTransmissionService` (**transitions #1–#3**: create + `FOR UPDATE` claim) — exists (see Build status below). The **send/Queueable chain applying transitions #4–#8, plus the trigger and recovery sweep, is not built yet** and remains gated on this specification.
+> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, `AttorneyReferralRequestMapper`, and `AttorneyTransmissionService` (create/claim **#1–#3** plus the **#4–#8b outcome-application methods** `applySendOutcome`/`applyExternalConflict`/`applyStaleRecovery`) — exists (see Build status below). All transition *logic* is now a synchronous, unit-tested layer. The **Queueable chain that invokes the send transitions, the trigger, and the recovery sweep are not built yet** and remain gated on this specification.
 > **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`.
 > **Owner** Care Connect integration team.
 > **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Transmission_Support` (read-only), `permissionsets/Integration_Transmission_Runtime` (execution path). `Integration_Admin` deliberately does **not** cover this object.
@@ -591,16 +591,18 @@ and the platform injects auth. Tests use `HttpCalloutMock` and need none of this
   **log payloads** in its `CalloutOutcome` — it does NOT persist an `Integration_Log__c` row; the
   send Queueable does, and end-to-end logging safety is only proven once they are tested together)
   — merged (PR #5)
-- ✅ `AttorneyTransmissionService` — **transitions #1–#3** (create-or-get + `FOR UPDATE` claim) + tests — in-flight (PR #6)
+- ✅ `AttorneyTransmissionService` — **transitions #1–#3** (create-or-get + `FOR UPDATE` claim) + tests — merged (PR #6)
+- ✅ `AttorneyTransmissionService` — **#4–#8b outcome application** (`applySendOutcome` #4–#7, `applyExternalConflict` #7b, `applyStaleRecovery` #8a/#8b) + backoff, and `AttorneyReferralRequestMapper` (`Referral__c`/`Contact` → request DTO) + tests — in-flight (PR #7)
 
 **Still to build — this document is the contract for it:**
 
-- ⏳ the serial Queueable chain (dispatcher → claim → sender) applying result transitions **#4–#8** ·
-  trigger + handler eligibility · retry and stale-processing recovery sweep · the live Named
-  Credential / Connected App config (see *Live authentication configuration* above)
+- ⏳ the serial Queueable chain (dispatcher → claim → sender) that INVOKES the now-executable send
+  transitions (`MAX_CLAIM_BATCH = 3`, per-callout timeout `30 s`) · trigger + handler eligibility ·
+  retry and stale-processing recovery sweep (invokes `applyStaleRecovery`) · the live Named Credential
+  / Connected App config (see *Live authentication configuration* above)
 
-Transitions #1–#3 are executable (`AttorneyTransmissionService`). What remains is the Queueable
-chain that consumes the claim + `AttorneyApiService`'s `CalloutOutcome` and applies #4–#8, the
+Every transition #1–#8b is now executable and unit-tested (`AttorneyTransmissionService`). What remains
+is the Queueable chain that consumes the claim + `AttorneyApiService`'s `CalloutOutcome` and applies #4–#8, the
 trigger, and the sweep.
 
 ## Tests this specification demands

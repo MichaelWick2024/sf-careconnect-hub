@@ -277,4 +277,215 @@ private class AttorneyTransmissionServiceTest {
             AttorneyTransmissionService.errorCodes(new List<Database.Error>())
         );
     }
+
+    // ---- #4–#8: apply a send outcome ---------------------------------------
+    //
+    // These produce REAL CalloutOutcomes via AttorneyApiService.sendReferral + a mock — never a
+    // fabricated one (its constructor is private on purpose). A mock callout still counts as a callout
+    // and cannot follow DML, so every test produces its outcome(s) FIRST, then does its DML.
+
+    private static final String CASE_UUID = '11111111-2222-4333-8444-555555555555';
+    private static final String CASE_RECORD_ID = 'a00000000000001AAA';
+    private static final String CORRELATION = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+    private class Mock implements HttpCalloutMock {
+        private Integer status; private String body;
+        private Mock(Integer status, String body) { this.status = status; this.body = body; }
+        public HttpResponse respond(HttpRequest req) {
+            HttpResponse r = new HttpResponse();
+            r.setStatusCode(status);
+            r.setHeader('Content-Type', 'application/json');
+            if (body != null) { r.setBody(body); }
+            return r;
+        }
+    }
+
+    private static AttorneyReferralRequest validRequest() {
+        AttorneyReferralRequest r = new AttorneyReferralRequest();
+        r.correlationId = CORRELATION;
+        r.careConnectReferralId = 'a01000000000001AAA';
+        r.referralType = 'Personal Injury';
+        r.client = new AttorneyReferralRequest.ClientInfo();
+        r.client.careConnectContactId = '003000000000001AAA';
+        r.client.fullName = 'Jane Doe';
+        return r;
+    }
+
+    private static AttorneyApiService.CalloutOutcome outcome(Integer status, String body) {
+        Test.setMock(HttpCalloutMock.class, new Mock(status, body));
+        return AttorneyApiService.sendReferral(validRequest());
+    }
+    private static AttorneyApiService.CalloutOutcome successOutcome() {
+        return outcome(200, JSON.serialize(new Map<String, Object>{
+            'correlationId' => CORRELATION, 'success' => true, 'attorneyCaseId' => CASE_UUID,
+            'attorneyCaseRecordId' => CASE_RECORD_ID, 'status' => 'Open', 'errorCode' => null
+        }));
+    }
+    private static AttorneyApiService.CalloutOutcome transientOutcome() { return outcome(500, '{}'); } // SERVER_ERROR
+    private static AttorneyApiService.CalloutOutcome permanentOutcome() { return outcome(400, '{}'); } // VALIDATION_REJECTED
+
+    // A persisted Processing row with a given Retry_Count and an in-flight claim, one minute in.
+    private static Integration_Transmission__c processing(Integer retryCount) {
+        Referral__c r = insertReferrals(1)[0];
+        Datetime aMinuteAgo = Datetime.now().addMinutes(-1);
+        Integration_Transmission__c t = new Integration_Transmission__c(
+            Referral__c = r.Id, Target_System__c = 'ATTORNEY', Operation__c = 'CREATE_REFERRAL',
+            Transmission_Key__c = String.valueOf(r.Id) + '|ATTORNEY|CREATE_REFERRAL',
+            Correlation_Id__c = Uuid.v4(), Status__c = 'Processing', Retry_Count__c = retryCount,
+            Claim_Token__c = 'cccccccc-dddd-4eee-8fff-999999999999',
+            Processing_Started_At__c = aMinuteAgo, Last_Attempt_At__c = aMinuteAgo
+        );
+        insert t;
+        return t;
+    }
+
+    private static Integration_Transmission__c reload(Id id) {
+        return [
+            SELECT Status__c, Retry_Count__c, Next_Retry_At__c, Last_Attempt_At__c, Processing_Started_At__c,
+                   Claim_Token__c, Last_Status_Code__c, Last_Error_Code__c, External_Record_Id__c,
+                   External_Record_Key__c, External_Salesforce_Id__c, Succeeded_At__c
+            FROM Integration_Transmission__c WHERE Id = :id
+        ];
+    }
+
+    @IsTest
+    static void successAppliesTransition4() {
+        AttorneyApiService.CalloutOutcome o = successOutcome(); // callout FIRST (before DML)
+        System.assertEquals(AttorneyApiService.Disposition.SUCCESS, o.disposition);
+
+        Integration_Transmission__c t = processing(0);
+        AttorneyTransmissionService.applySendOutcome(t, o);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Succeeded', after.Status__c);
+        System.assertEquals(CASE_UUID, after.External_Record_Id__c);
+        System.assertEquals('ATTORNEY|' + CASE_UUID, after.External_Record_Key__c);
+        System.assertEquals(CASE_RECORD_ID, after.External_Salesforce_Id__c);
+        System.assertEquals(200, after.Last_Status_Code__c);
+        System.assertNotEquals(null, after.Succeeded_At__c);
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Processing_Started_At__c);
+        System.assertEquals(null, after.Next_Retry_At__c);
+        System.assertEquals(null, after.Last_Error_Code__c);
+        System.assertNotEquals(null, after.Last_Attempt_At__c, 'Last_Attempt_At is durable, never cleared');
+    }
+
+    @IsTest
+    static void transientWithBudgetAppliesTransition5() {
+        AttorneyApiService.CalloutOutcome o = transientOutcome();
+        System.assertEquals(AttorneyApiService.Disposition.TRANSIENT_FAILURE, o.disposition);
+
+        Integration_Transmission__c t = processing(1); // one retry performed; budget remains
+        AttorneyTransmissionService.applySendOutcome(t, o);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Retry Scheduled', after.Status__c);
+        System.assertEquals('SERVER_ERROR', after.Last_Error_Code__c);
+        System.assertEquals(1, after.Retry_Count__c, 'applySendOutcome never touches Retry_Count (the CLAIM does)');
+        System.assertNotEquals(null, after.Next_Retry_At__c);
+        System.assert(after.Next_Retry_At__c > after.Last_Attempt_At__c, 'retry is scheduled in the future');
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Processing_Started_At__c);
+    }
+
+    @IsTest
+    static void transientNoBudgetAppliesTransition6() {
+        AttorneyApiService.CalloutOutcome o = transientOutcome();
+
+        Integration_Transmission__c t = processing(3); // MAX_RETRIES retries performed; budget spent
+        AttorneyTransmissionService.applySendOutcome(t, o);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Failed', after.Status__c);
+        System.assertEquals('RETRY_BUDGET_EXHAUSTED', after.Last_Error_Code__c);
+        System.assertEquals(null, after.Next_Retry_At__c);
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Processing_Started_At__c);
+    }
+
+    @IsTest
+    static void permanentAppliesTransition7() {
+        AttorneyApiService.CalloutOutcome o = permanentOutcome();
+        System.assertEquals(AttorneyApiService.Disposition.PERMANENT_FAILURE, o.disposition);
+
+        Integration_Transmission__c t = processing(0);
+        AttorneyTransmissionService.applySendOutcome(t, o);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Failed', after.Status__c);
+        System.assertEquals('VALIDATION_REJECTED', after.Last_Error_Code__c, 'the outcome error code, not a budget code');
+        System.assertEquals(400, after.Last_Status_Code__c);
+        System.assertEquals(null, after.Next_Retry_At__c);
+        System.assertEquals(null, after.Claim_Token__c);
+    }
+
+    @IsTest
+    static void backoffGrowsWithRetryCount() {
+        // Both callouts first (no DML between a callout and the next), then the DML rows.
+        AttorneyApiService.CalloutOutcome o0 = transientOutcome();
+        AttorneyApiService.CalloutOutcome o2 = transientOutcome();
+
+        Integration_Transmission__c t0 = processing(0);
+        AttorneyTransmissionService.applySendOutcome(t0, o0);
+        System.assertEquals(t0.Last_Attempt_At__c.addMinutes(1), t0.Next_Retry_At__c, 'Retry_Count 0 -> +1 min');
+
+        Integration_Transmission__c t2 = processing(2);
+        AttorneyTransmissionService.applySendOutcome(t2, o2);
+        System.assertEquals(t2.Last_Attempt_At__c.addMinutes(4), t2.Next_Retry_At__c, 'Retry_Count 2 -> +4 min');
+    }
+
+    @IsTest
+    static void externalConflictAppliesTransition7b() {
+        Integration_Transmission__c t = processing(0);
+        // a success moment: external identifiers populated, about to be persisted...
+        t.Status__c = 'Succeeded';
+        t.External_Record_Id__c = CASE_UUID;
+        t.External_Record_Key__c = 'ATTORNEY|' + CASE_UUID;
+        t.External_Salesforce_Id__c = CASE_RECORD_ID;
+        // ...but the unique-key write collided; the caller reclassifies:
+        AttorneyTransmissionService.applyExternalConflict(t);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Failed', after.Status__c);
+        System.assertEquals('EXTERNAL_RECORD_CONFLICT', after.Last_Error_Code__c);
+        System.assertEquals(null, after.External_Record_Id__c, 'conflicting identifiers must NOT be persisted');
+        System.assertEquals(null, after.External_Record_Key__c);
+        System.assertEquals(null, after.External_Salesforce_Id__c);
+        System.assertEquals(null, after.Succeeded_At__c);
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Next_Retry_At__c);
+    }
+
+    @IsTest
+    static void staleWithBudgetAppliesTransition8a() {
+        Integration_Transmission__c t = processing(1);
+        AttorneyTransmissionService.applyStaleRecovery(t);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Retry Scheduled', after.Status__c);
+        System.assertEquals('STALE_CLAIM_RECOVERED', after.Last_Error_Code__c);
+        System.assertNotEquals(null, after.Next_Retry_At__c, 'recovered row is immediately eligible');
+        System.assertEquals(null, after.Claim_Token__c);
+        System.assertEquals(null, after.Processing_Started_At__c);
+    }
+
+    @IsTest
+    static void staleNoBudgetAppliesTransition8b() {
+        Integration_Transmission__c t = processing(3);
+        AttorneyTransmissionService.applyStaleRecovery(t);
+        update t;
+
+        Integration_Transmission__c after = reload(t.Id);
+        System.assertEquals('Failed', after.Status__c);
+        System.assertEquals('RETRY_BUDGET_EXHAUSTED', after.Last_Error_Code__c,
+            'a repeatedly-dying sender terminates once the budget is spent');
+        System.assertEquals(null, after.Next_Retry_At__c);
+        System.assertEquals(null, after.Claim_Token__c);
+    }
 }

@@ -25,10 +25,29 @@ public with sharing class AttorneyTransmissionService {
     @TestVisible private static final String OPERATION = 'CREATE_REFERRAL';
     public static final Integer MAX_RETRIES = 3;
 
+    // Namespaces the External_Record_Key (TARGET_CODE|external id) so uniqueness is per target system.
+    // Attorney's code; when Provider send lands, its outcome application passes 'PROVIDER'.
+    private static final String TARGET_CODE = TARGET; // 'ATTORNEY'
+
+    // Backoff (transition #5): Next_Retry_At = Last_Attempt_At + BASE * 2^Retry_Count, capped.
+    // BASE = 1 min -> retries at ~+1m, +2m, +4m. Constants live here; custom metadata later.
+    @TestVisible private static final Integer BASE_BACKOFF_MINUTES = 1;
+    @TestVisible private static final Integer MAX_BACKOFF_MINUTES = 60;
+
     // Status API values (restricted picklist).
     private static final String PENDING = 'Pending';
     private static final String PROCESSING = 'Processing';
     private static final String RETRY_SCHEDULED = 'Retry Scheduled';
+    private static final String SUCCEEDED = 'Succeeded';
+    private static final String FAILED = 'Failed';
+
+    // Controlled internal error codes this layer WRITES. The callout-derived codes (RATE_LIMITED,
+    // SERVER_ERROR, VALIDATION_REJECTED, ...) arrive already-classified on the CalloutOutcome; these
+    // three are the ones the STATE MACHINE originates, never a remote value. (Last_Error_Code__c is
+    // Text(80), controlled vocabulary only — never a remote or platform message.)
+    @TestVisible private static final String RETRY_BUDGET_EXHAUSTED = 'RETRY_BUDGET_EXHAUSTED';
+    @TestVisible private static final String EXTERNAL_RECORD_CONFLICT = 'EXTERNAL_RECORD_CONFLICT';
+    @TestVisible private static final String STALE_CLAIM_RECOVERED = 'STALE_CLAIM_RECOVERED';
 
     // ---- #1: create-or-get -------------------------------------------------
 
@@ -197,7 +216,117 @@ public with sharing class AttorneyTransmissionService {
         return false; // Processing / Succeeded / Failed are not claimable
     }
 
+    // ---- #4–#7b: apply a send outcome to a claimed row (in memory) ----------
+
+    /**
+     * Applies the callout result to a claimed (Processing) transmission IN MEMORY — the caller owns
+     * the DML (all callouts must precede any DML in the sender). Dispatches on disposition and budget:
+     *   #4  SUCCESS             → Succeeded (external ids, Succeeded_At; clears in-flight + retry state)
+     *   #5  TRANSIENT, budget   → Retry Scheduled (Last_Error_Code, backoff Next_Retry_At)
+     *   #6  TRANSIENT, no budget → Failed (RETRY_BUDGET_EXHAUSTED)
+     *   #7  PERMANENT           → Failed (the outcome's own error code)
+     *
+     * Retry_Count is NOT incremented here — it increments on the next CLAIM (#3). This only READS it
+     * to decide whether the budget is spent, so a row that has performed MAX_RETRIES retries and fails
+     * transiently once more terminates (#6) instead of scheduling a retry that could never run.
+     *
+     * A #4 write sets the unique External_Record_Key__c; if the caller's DML reports DUPLICATE_VALUE
+     * on it, the caller must reclassify that row via applyExternalConflict (#7b) — this method cannot,
+     * because the collision is only visible at DML time.
+     */
+    public static void applySendOutcome(Integration_Transmission__c t, AttorneyApiService.CalloutOutcome o) {
+        Datetime now = Datetime.now();
+        t.Last_Status_Code__c = o.statusCode; // most recent HTTP status (0 when there was no response)
+
+        if (o.disposition == AttorneyApiService.Disposition.SUCCESS) {
+            t.Status__c = SUCCEEDED;
+            t.External_Record_Id__c = o.attorneyCaseId;                     // validated v4
+            t.External_Record_Key__c = TARGET_CODE + '|' + o.attorneyCaseId;
+            t.External_Salesforce_Id__c = o.attorneyCaseRecordId;           // may be null; diagnostics only
+            t.Succeeded_At__c = now;
+            t.Last_Error_Code__c = null;
+            clearInFlight(t);
+            t.Next_Retry_At__c = null;
+            return;
+        }
+
+        if (o.disposition == AttorneyApiService.Disposition.PERMANENT_FAILURE) {
+            t.Status__c = FAILED;
+            t.Last_Error_Code__c = o.errorCode;
+            clearInFlight(t);
+            t.Next_Retry_At__c = null;
+            return;
+        }
+
+        // TRANSIENT_FAILURE — schedule a retry only if the budget is not already spent.
+        if (retryCount(t) < MAX_RETRIES) {
+            t.Status__c = RETRY_SCHEDULED;
+            t.Last_Error_Code__c = o.errorCode;
+            t.Next_Retry_At__c = backoff(t, now);
+            clearInFlight(t);
+        } else {
+            t.Status__c = FAILED;
+            t.Last_Error_Code__c = RETRY_BUDGET_EXHAUSTED;
+            clearInFlight(t);
+            t.Next_Retry_At__c = null;
+        }
+    }
+
+    /**
+     * Transition #7b — the unique External_Record_Key__c write collided (a DUPLICATE_VALUE the caller
+     * caught at DML). Two transmissions claim the same target business record: a defect that needs a
+     * human, never a retry. Move to Failed and DO NOT persist the conflicting external identifiers.
+     *
+     * This is the one place a DUPLICATE_VALUE means the OPPOSITE of what it means on the claim/create
+     * path: there it means "someone else won, resolve to their row" (normal); here it means "two rows
+     * disagree about reality" (a defect). Same status code, opposite handling.
+     */
+    public static void applyExternalConflict(Integration_Transmission__c t) {
+        t.Status__c = FAILED;
+        t.Last_Error_Code__c = EXTERNAL_RECORD_CONFLICT;
+        t.External_Record_Id__c = null;      // do NOT persist the conflicting identifiers
+        t.External_Record_Key__c = null;
+        t.External_Salesforce_Id__c = null;
+        t.Succeeded_At__c = null;
+        clearInFlight(t);
+        t.Next_Retry_At__c = null;
+    }
+
+    /**
+     * Transitions #8a / #8b — the recovery sweep found this row stranded in Processing past the stale
+     * cutoff (a sender that died after claiming). Recover to Retry Scheduled if the budget is not spent
+     * (#8a), else fail it (#8b). The budget check is what BOUNDS a repeatedly-dying sender: without it,
+     * a row that goes stale on every attempt would be recovered forever.
+     */
+    public static void applyStaleRecovery(Integration_Transmission__c t) {
+        if (retryCount(t) < MAX_RETRIES) {
+            t.Status__c = RETRY_SCHEDULED;
+            t.Last_Error_Code__c = STALE_CLAIM_RECOVERED;
+            t.Next_Retry_At__c = Datetime.now(); // immediately eligible; the next claim applies #3
+            clearInFlight(t);
+        } else {
+            t.Status__c = FAILED;
+            t.Last_Error_Code__c = RETRY_BUDGET_EXHAUSTED;
+            clearInFlight(t);
+            t.Next_Retry_At__c = null;
+        }
+    }
+
     // ---- helpers -----------------------------------------------------------
+
+    // Clears the per-attempt in-flight markers. Last_Attempt_At__c is deliberately NOT cleared — it is
+    // the durable record of when the last attempt began. Next_Retry_At__c is handled per transition
+    // (set by #5/#8a, cleared by every terminal/success path).
+    private static void clearInFlight(Integration_Transmission__c t) {
+        t.Claim_Token__c = null;
+        t.Processing_Started_At__c = null;
+    }
+
+    private static Datetime backoff(Integration_Transmission__c t, Datetime now) {
+        Datetime base = t.Last_Attempt_At__c != null ? t.Last_Attempt_At__c : now;
+        Integer minutes = BASE_BACKOFF_MINUTES * (Integer) Math.pow(2, retryCount(t));
+        return base.addMinutes(Math.min(minutes, MAX_BACKOFF_MINUTES));
+    }
 
     private static String keyFor(Id referralId) {
         return String.valueOf(referralId) + '|' + TARGET + '|' + OPERATION;
