@@ -140,7 +140,6 @@ public with sharing class AttorneyTransmissionService {
         if (transmissionId == null) {
             return new ClaimResult(null, false, null, 'not-found');
         }
-        Datetime now = Datetime.now();
 
         List<Integration_Transmission__c> locked;
         try {
@@ -162,8 +161,11 @@ public with sharing class AttorneyTransmissionService {
             return new ClaimResult(transmissionId, false, null, 'not-found');
         }
 
+        // Capture the time AFTER the row is acquired, not before the (possibly delayed) lock wait —
+        // so the timestamps and the due-check reflect the successful claim, not the lock request.
+        Datetime claimTime = Datetime.now();
         Integration_Transmission__c t = locked[0];
-        if (!isClaimable(t, now)) {
+        if (!isClaimable(t, claimTime)) {
             return new ClaimResult(t.Id, false, null, 'not-eligible');
         }
 
@@ -171,8 +173,8 @@ public with sharing class AttorneyTransmissionService {
         String token = Uuid.v4();                             // new per attempt
         t.Status__c = PROCESSING;
         t.Claim_Token__c = token;
-        t.Processing_Started_At__c = now;
-        t.Last_Attempt_At__c = now;
+        t.Processing_Started_At__c = claimTime;
+        t.Last_Attempt_At__c = claimTime;
         if (fromRetry) {
             t.Retry_Count__c = retryCount(t) + 1; // transition #3 increments
             t.Next_Retry_At__c = null;            // ...and clears the now-meaningless retry time
@@ -224,7 +226,13 @@ public with sharing class AttorneyTransmissionService {
         return true;
     }
 
+    @TestVisible
     private static String errorCodes(List<Database.Error> errors) {
+        // Fails closed: the caller reaches here for a hard failure, so a null/empty error list must
+        // still yield a controlled code, never an NPE or a blank diagnostic.
+        if (errors == null || errors.isEmpty()) {
+            return 'UNKNOWN';
+        }
         List<String> codes = new List<String>();
         for (Database.Error e : errors) {
             codes.add(String.valueOf(e.getStatusCode()));

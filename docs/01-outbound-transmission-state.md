@@ -588,7 +588,9 @@ and the platform injects auth. Tests use `HttpCalloutMock` and need none of this
 - ✅ `AttorneyReferralResponseValidator` (the five response checks) + tests — merged (PR #4)
 - ✅ `AttorneyReferralRequestValidator` (pre-callout request checks → `INVALID_REQUEST`) + tests — merged (PR #5)
 - ✅ `AttorneyApiService` (callout, HTTP → controlled-error classification, value-safe allowlisted
-  logging via `HttpCalloutMock`) — merged (PR #5)
+  **log payloads** in its `CalloutOutcome` — it does NOT persist an `Integration_Log__c` row; the
+  send Queueable does, and end-to-end logging safety is only proven once they are tested together)
+  — merged (PR #5)
 - ✅ `AttorneyTransmissionService` — **transitions #1–#3** (create-or-get + `FOR UPDATE` claim) + tests — in-flight (PR #6)
 
 **Still to build — this document is the contract for it:**

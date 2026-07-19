@@ -265,4 +265,16 @@ private class AttorneyTransmissionServiceTest {
             System.assertEquals('not-eligible', cr.reason);
         }
     }
+
+    // The hard-failure formatter is reached only when a row failed but Salesforce reports no usable
+    // error list. That state can't be manufactured from a real SaveResult (no public constructor), so
+    // this proves the formatter itself fails closed rather than pretending to reproduce the DML path.
+    @IsTest
+    static void errorCodesFailsClosedOnNullOrEmpty() {
+        System.assertEquals('UNKNOWN', AttorneyTransmissionService.errorCodes(null));
+        System.assertEquals(
+            'UNKNOWN',
+            AttorneyTransmissionService.errorCodes(new List<Database.Error>())
+        );
+    }
 }
