@@ -2,7 +2,7 @@
 
 > **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
 > **Audience** Salesforce developers building or maintaining Care Connect outbound.
-> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, and `AttorneyApiService` (callout + classification) — exists (see Build status below). The **claim/send state machine that drives the transitions in this document is not built yet** and remains gated on this specification.
+> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, and `AttorneyTransmissionService` (**transitions #1–#3**: create + `FOR UPDATE` claim) — exists (see Build status below). The **send/Queueable chain applying transitions #4–#8, plus the trigger and recovery sweep, is not built yet** and remains gated on this specification.
 > **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`.
 > **Owner** Care Connect integration team.
 > **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Transmission_Support` (read-only), `permissionsets/Integration_Transmission_Runtime` (execution path). `Integration_Admin` deliberately does **not** cover this object.
@@ -201,10 +201,12 @@ it adds a second place to drift.
 | Uppercase, stable picklist **API names** in the metadata | ✅ **Enforced now** — deployed and verified |
 | `Transmission_Key__c` **Unique + External ID** at the database | ✅ **Enforced now** — deployed and verified |
 | **Protect picklist API names** from casual modification (org setting) | ⏳ **Planned** — not yet configured |
-| Test asserting the expected API names still exist | ⏳ **Planned** — no Apex in this org yet |
+| Test asserting the expected API names still exist | ✅ **Enforced** — `AttorneyTransmissionServiceTest.picklistApiNamesTheServiceDependsOnStillExist` (Target/Operation by containment, Status by exact equality) |
 
-Nothing in this repository *enforces* the planned rows today. This PR contains zero Apex, so any
-claim of a test-based control would be a promise, not a control.
+The **org-setting** protection above is still planned. The **test-based** drift guard is now enforced:
+a label rename stays harmless, but removing or renaming a required API value fails the build with a
+focused diagnostic (`Target_System__c` ATTORNEY/PROVIDER, `Operation__c` CREATE_REFERRAL, and the five
+`Status__c` states) rather than through an unrelated create/claim test.
 
 ## State machine
 
@@ -234,7 +236,7 @@ claim of a test-based control would be a promise, not a control.
 |---|---|---|---|---|
 | 1 | *(none)* | Referral becomes eligible | **Pending** | `Correlation_Id = Uuid.v4()` **once**; `Transmission_Key = key`; `Retry_Count = 0` |
 | 2 | Pending | claimed | **Processing** | `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now`. **`Retry_Count` unchanged** — this is attempt 1, not a retry |
-| 3 | Retry Scheduled *(`Next_Retry_At <= now` **and `Retry_Count < MAX_RETRIES`**)* | claimed | **Processing** | **`Retry_Count++`**; `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now` |
+| 3 | Retry Scheduled *(`Next_Retry_At <= now` **and `Retry_Count < MAX_RETRIES`**)* | claimed | **Processing** | **`Retry_Count++`**; **`Next_Retry_At = null`** (meaningful only in Retry Scheduled); `Claim_Token = Uuid.v4()`; `Processing_Started_At = now`; `Last_Attempt_At = now` |
 | 4 | Processing | **valid** success response | **Succeeded** | `External_Record_Id`, **`External_Record_Key = <target code>\|<external id>`**, `External_Salesforce_Id`, `Last_Status_Code`, `Succeeded_At = now`; **clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`, `Last_Error_Code`** |
 | 5 | Processing | transient failure, `Retry_Count < MAX_RETRIES` | **Retry Scheduled** | `Last_Status_Code`, `Last_Error_Code`, `Next_Retry_At = backoff`; clear `Claim_Token`, `Processing_Started_At` |
 | 6 | Processing | transient failure, `Retry_Count >= MAX_RETRIES` | **Failed** | `Last_Status_Code`, `Last_Error_Code = RETRY_BUDGET_EXHAUSTED`; **clear `Claim_Token`, `Processing_Started_At`, `Next_Retry_At`** |
@@ -491,8 +493,10 @@ Trigger transaction  (synchronous)
     │  enqueue ONCE  — guarded by a transaction-level static
     ▼
 Dispatcher / claimant  (async)
-    │  FOR UPDATE a bounded group; claim rows; assign a token to each
-    │  enqueue EXACTLY ONE job
+    │  take a named, BOUNDED set of transmission ids (define MAX_CLAIM_BATCH)
+    │  call singular claim(Id) for each  — one WHERE Id = :id FOR UPDATE per call
+    │  collect the successful {transmissionId, claimToken} pairs
+    │  enqueue EXACTLY ONE sender
     ▼
 Sender  (async)
     │  ALL callouts first  ──► then persist results + logs
@@ -500,6 +504,12 @@ Sender  (async)
     ▼
 Dispatcher / claimant  …
 ```
+
+Claiming is **singular** (`AttorneyTransmissionService.claim(Id)`), not a batch `FOR UPDATE`, so a
+lock failure classifies **one** transmission as `locked` rather than the whole group. It still runs
+inside one dispatcher transaction, so a contested row can delay the dispatcher and locks already
+acquired stay held until the transaction ends — which is exactly why the batch must be **bounded**
+(the next PR defines `MAX_CLAIM_BATCH`; Salesforce lock guidance recommends smaller transactions).
 
 ### Normative rules
 
@@ -576,18 +586,20 @@ and the platform injects auth. Tests use `HttpCalloutMock` and need none of this
 - ✅ `Uuid` + tests — merged (PR #2)
 - ✅ `AttorneyReferralRequest` / `AttorneyReferralResponse` DTOs + tests — merged (PR #3)
 - ✅ `AttorneyReferralResponseValidator` (the five response checks) + tests — merged (PR #4)
-- ✅ `AttorneyReferralRequestValidator` (pre-callout request checks → `INVALID_REQUEST`) + tests — in-flight
+- ✅ `AttorneyReferralRequestValidator` (pre-callout request checks → `INVALID_REQUEST`) + tests — merged (PR #5)
 - ✅ `AttorneyApiService` (callout, HTTP → controlled-error classification, value-safe allowlisted
-  logging via `HttpCalloutMock`) — in-flight
+  logging via `HttpCalloutMock`) — merged (PR #5)
+- ✅ `AttorneyTransmissionService` — **transitions #1–#3** (create-or-get + `FOR UPDATE` claim) + tests — in-flight (PR #6)
 
 **Still to build — this document is the contract for it:**
 
-- ⏳ transmission creation/claim service · claim Queueable · callout Queueable (the serial chain) ·
+- ⏳ the serial Queueable chain (dispatcher → claim → sender) applying result transitions **#4–#8** ·
   trigger + handler eligibility · retry and stale-processing recovery sweep · the live Named
   Credential / Connected App config (see *Live authentication configuration* above)
 
-`AttorneyApiService` returns a controlled `CalloutOutcome`; it does not persist. The state machine
-that consumes it — claim, send, and the transition writes above — is the remaining work.
+Transitions #1–#3 are executable (`AttorneyTransmissionService`). What remains is the Queueable
+chain that consumes the claim + `AttorneyApiService`'s `CalloutOutcome` and applies #4–#8, the
+trigger, and the sweep.
 
 ## Tests this specification demands
 
