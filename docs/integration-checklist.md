@@ -520,30 +520,37 @@ implements several **Tier 3** code-level protections. Remaining work includes **
 recovery logic, live authentication configuration, end-to-end verification, operational documentation,
 and production monitoring**.
 
-### Completed
+### 1. Completed and merged to `main`
 
 - Business discovery, system ownership, and the **API contract** (with drift guards).
 - **DTOs, mapper, pre-callout request validator, response validator** (2xx-is-not-success, correlation match, id formats, body-size bound).
 - **HTTP layer** with controlled error classification; no-DML-before-callout; all-callouts-before-DML batching.
 - **Idempotency** via a unique `Transmission_Key__c` + the receiver's referral-id idempotency; **at-least-once** delivery documented with its enforcement located.
 - **Transmission state model** as the source of truth; **attempt logs** as history, value-safe.
-- **Send chain** (dispatcher → sender) applying transitions #4–#7b, with **claim tokens**, **authoritative post-callout re-lock**, **singular locking**, **serial chain + depth policy**, **partial-DML-plus-inspection**, and **best-effort logging**.
-- **Multi-target route authorization** (query scope + freshly-locked route check) and the **exhausted-retry ceiling repair** (#11).
-- **Backoff** sized to the hourly sweep (60/120/240).
-- Extensive **`HttpCalloutMock` unit tests**, including concurrency, route, and partial-DML isolation, plus regression tests for discovered defects.
+- **Send chain** (dispatcher → sender) applying transitions #4–#7b, with **claim tokens**, **authoritative post-callout re-lock**, **singular locking**, **serial chain + the chained-enqueue depth guard** (`canEnqueueChild`), **partial-DML-plus-inspection**, and **best-effort logging**.
+- The **`HttpCalloutMock` unit tests** for the above, including concurrency, post-callout re-lock, and partial-DML isolation, plus regression tests for defects found during review.
 
-### Partially completed
+### 2. Implemented in open PR #9 (not yet merged)
 
-- **Operational recovery** — the transmission fields and repair transitions exist and are unit-tested; the **scheduled hourly sweep** and the **trigger** that starts the chain are **planned for future PRs**, not yet built.
-- **Documentation** — the normative state spec and this checklist exist; a support **runbook** and an error-code **catalog** page are not yet written.
-- **Permissions/layout** — the eligibility field and permission sets exist; the full production deployment model has not been exercised.
+- **`Ready_For_Attorney__c`** eligibility field, its **permission-set FLS**, and its **page-layout** addition.
+- **`enqueueRoot`** — the shared root-enqueue (used by both the trigger and the sweep) that sets an explicit `MaximumQueueableStackDepth` (`MAX_CHAIN_DEPTH = 140`, `MAX_ROOT_CANDIDATES = 200`), with the depth-relationship test. *(The chained-enqueue depth guard it complements is already merged, above.)*
+- **Multi-target route authorization** — the `claim(id, target, operation)` route gate, the dispatcher passing the Attorney route, and the sender's pre-callout route check as defense in depth.
+- The **exhausted-retry ceiling repair** (transition #11).
+- **Backoff resized to the hourly sweep** (`BASE = 60`, cap `240` → 60/120/240).
+- The **related PR #9 tests** (route refusal at all three layers, due-only #11 repair, `enqueueRoot`/normalization, depth relationship).
 
-### Not yet completed — and the two that matter most
+### 3. Planned for future PRs
+
+- The **trigger + handler** — creates transmissions for newly-`Ready_For_Attorney__c` referrals every firing, and enqueues at most one root via `enqueueRoot`, guarded by a transaction-level static.
+- The **scheduled hourly recovery sweep** — Attorney-scoped query, singular re-lock, `applyStaleRecovery` (#8) / `applyExhaustedRetryRepair` (#11), `enqueueRoot`, and no synthesized attempt logs.
+- Transition **#9 manual retry** — specified, deliberately **deferred** to a later hardening phase (a controlled admin action, not a checkbox toggle).
+
+### 4. Not yet completed — and the two that matter most
 
 - ⚠️ **Live authentication configuration.** The Connected App (Attorney org) and the External/Named Credential (Care Connect org) are **not wired up**. All callouts run against `HttpCalloutMock`.
 - ⚠️ **A real Care Connect → Attorney sandbox end-to-end test.** Nothing has proven the two orgs actually communicate — that the endpoint, the live credential, and the field contract work against a real peer. **`HttpCalloutMock` cannot prove this**; a green test suite and a broken integration are indistinguishable until the first real call.
-- Transition **#9 manual retry** — specified, deliberately **deferred** to a later hardening phase (a controlled admin action, not a checkbox toggle).
 - Production **deployment, monitoring, and alerting**.
+- A support **runbook** and an error-code **catalog** page (the normative state spec and this checklist exist; these operator docs do not).
 
 These two ⚠️ items are the largest remaining risk. Everything else is logic we can verify with tests;
 these are the parts tests structurally *cannot* verify, and they are exactly where integrations that "pass
