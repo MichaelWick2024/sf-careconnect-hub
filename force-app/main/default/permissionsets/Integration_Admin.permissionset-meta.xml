@@ -22,6 +22,11 @@
     </objectPermissions>
     <fieldPermissions>
         <editable>true</editable>
+        <field>Referral__c.Ready_For_Attorney__c</field>
+        <readable>true</readable>
+    </fieldPermissions>
+    <fieldPermissions>
+        <editable>true</editable>
         <field>Referral__c.Status__c</field>
         <readable>true</readable>
     </fieldPermissions>

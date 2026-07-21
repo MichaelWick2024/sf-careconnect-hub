@@ -6,6 +6,7 @@
  *   #4–#7   apply a controlled callout outcome  (applySendOutcome)
  *   #7b     external-record conflict            (applyExternalConflict)
  *   #8a–#8b stale-claim recovery                (applyStaleRecovery)
+ *   #11     exhausted-retry repair              (applyExhaustedRetryRepair)
  *
  * Creation and claim perform their own DML. The outcome/recovery methods mutate a record IN MEMORY;
  * their callers own locking and persistence (a sender does every callout before any DML). This class
@@ -37,8 +38,8 @@
  */
 public with sharing class AttorneyTransmissionService {
 
-    @TestVisible private static final String TARGET = 'ATTORNEY';
-    @TestVisible private static final String OPERATION = 'CREATE_REFERRAL';
+    public static final String TARGET = 'ATTORNEY';
+    public static final String OPERATION = 'CREATE_REFERRAL';
     public static final Integer MAX_RETRIES = 3;
 
     // Namespaces the External_Record_Key (TARGET_CODE|external id) so uniqueness is per target system.
@@ -46,9 +47,12 @@ public with sharing class AttorneyTransmissionService {
     private static final String TARGET_CODE = TARGET; // 'ATTORNEY'
 
     // Backoff (transition #5): Next_Retry_At = Last_Attempt_At + BASE * 2^Retry_Count, capped.
-    // BASE = 1 min -> retries at ~+1m, +2m, +4m. Constants live here; custom metadata later.
-    @TestVisible private static final Integer BASE_BACKOFF_MINUTES = 1;
-    @TestVisible private static final Integer MAX_BACKOFF_MINUTES = 60;
+    // BASE = 60 min -> retries become DUE at ~+1h, +2h, +4h. This is sized to the recovery sweep, which
+    // is scheduled HOURLY (a single Scheduled Apex job cannot run more than once per hour), so a shorter
+    // base could only mark a row due sooner than the sweep can ever pick it up. The cap must exceed the
+    // largest scheduled backoff (60 * 2^(MAX_RETRIES-1) = 240) or it would flatten the schedule.
+    @TestVisible private static final Integer BASE_BACKOFF_MINUTES = 60;
+    @TestVisible private static final Integer MAX_BACKOFF_MINUTES = 240;
 
     // Status API values (restricted picklist).
     private static final String PENDING = 'Pending';
@@ -148,7 +152,7 @@ public with sharing class AttorneyTransmissionService {
         public Id transmissionId { get; private set; }
         public Boolean claimed { get; private set; }
         public String claimToken { get; private set; } // set only when claimed
-        public String reason { get; private set; }     // when not claimed: 'not-eligible' | 'locked' | 'not-found'
+        public String reason { get; private set; }     // when not claimed: 'not-eligible' | 'locked' | 'not-found' | 'wrong-target'
         private ClaimResult(Id transmissionId, Boolean claimed, String claimToken, String reason) {
             this.transmissionId = transmissionId;
             this.claimed = claimed;
@@ -161,8 +165,15 @@ public with sharing class AttorneyTransmissionService {
      * Claims ONE transmission with a row lock. A successful claim moves it to Processing, assigns a
      * fresh Claim_Token__c, and (from Retry Scheduled) increments Retry_Count__c and clears
      * Next_Retry_At__c. Returns `locked` if another transaction holds the row (a normal concurrency
-     * outcome), `not-eligible` if its state disallows it, `not-found` if it does not exist. Only the
-     * returned claim token authorizes the subsequent send.
+     * outcome), `not-eligible` if its state disallows it, `not-found` if it does not exist,
+     * `wrong-target` if the row does not belong to the expected target/operation. Only the returned
+     * claim token authorizes the subsequent send.
+     *
+     * ROUTE BOUNDARY. Integration_Transmission__c is shared by Attorney and Provider, so the caller must
+     * name the target/operation it is entitled to process; a freshly-locked row whose Target_System__c
+     * or Operation__c does not match is refused (`wrong-target`) and NOT mutated. This keeps the claim
+     * target-agnostic (the caller decides the route) while making it route-SAFE — a Provider row handed
+     * to the Attorney chain can never be claimed and sent through the Attorney endpoint.
      *
      * Claim is deliberately SINGULAR (matching the normative spec's `WHERE Id = :id FOR UPDATE`), so
      * a lock-failure result is confined to the contested row. NOTE: the dispatcher loops this within
@@ -171,7 +182,7 @@ public with sharing class AttorneyTransmissionService {
      * stay held until it ends. Singular claiming bounds the blast radius of a lock failure; it does
      * not make contention free. The dispatcher must therefore loop a BOUNDED batch.
      */
-    public static ClaimResult claim(Id transmissionId) {
+    public static ClaimResult claim(Id transmissionId, String expectedTarget, String expectedOperation) {
         if (transmissionId == null) {
             return new ClaimResult(null, false, null, 'not-found');
         }
@@ -179,7 +190,7 @@ public with sharing class AttorneyTransmissionService {
         List<Integration_Transmission__c> locked;
         try {
             locked = [
-                SELECT Id, Status__c, Next_Retry_At__c, Retry_Count__c
+                SELECT Id, Status__c, Next_Retry_At__c, Retry_Count__c, Target_System__c, Operation__c
                 FROM Integration_Transmission__c
                 WHERE Id = :transmissionId
                 FOR UPDATE
@@ -196,10 +207,15 @@ public with sharing class AttorneyTransmissionService {
             return new ClaimResult(transmissionId, false, null, 'not-found');
         }
 
+        Integration_Transmission__c t = locked[0];
+        // Route boundary FIRST (against freshly-locked state) — a mismatched row is not ours to touch.
+        if (t.Target_System__c != expectedTarget || t.Operation__c != expectedOperation) {
+            return new ClaimResult(t.Id, false, null, 'wrong-target');
+        }
+
         // Capture the time AFTER the row is acquired, not before the (possibly delayed) lock wait —
         // so the timestamps and the due-check reflect the successful claim, not the lock request.
         Datetime claimTime = Datetime.now();
-        Integration_Transmission__c t = locked[0];
         if (!isClaimable(t, claimTime)) {
             return new ClaimResult(t.Id, false, null, 'not-eligible');
         }
@@ -376,6 +392,30 @@ public with sharing class AttorneyTransmissionService {
             clearInFlight(t);
             t.Next_Retry_At__c = null;
         }
+        return new ApplyResult(true, null);
+    }
+
+    /**
+     * Defensive invariant repair — NOT a send attempt, and not a stale recovery. A due Retry Scheduled
+     * row whose Retry_Count has reached MAX_RETRIES can never be claimed (claim() refuses it at the
+     * ceiling), yet no send transition moves it to Failed — so without this it would sit Retry Scheduled
+     * forever. The recovery sweep calls this on a freshly-locked row to close that gap.
+     *
+     * AUTHORIZATION: writes ONLY a row still Retry Scheduled, at/over the retry ceiling, AND actually DUE
+     * (Next_Retry_At non-null and <= sweepTime) — the same due predicate the claim path enforces, made
+     * authoritative here rather than relying on the sweep's snapshot query. Otherwise the row is left
+     * UNTOUCHED and ApplyResult.reason is 'not-eligible'. It makes no callout and writes no attempt log
+     * (the sweep never manufactures a send result that did not happen).
+     */
+    public static ApplyResult applyExhaustedRetryRepair(Integration_Transmission__c t, Datetime sweepTime) {
+        Boolean due = t.Next_Retry_At__c != null && t.Next_Retry_At__c <= sweepTime;
+        if (t.Status__c != RETRY_SCHEDULED || retryCount(t) < MAX_RETRIES || !due) {
+            return new ApplyResult(false, 'not-eligible');
+        }
+        t.Status__c = FAILED;
+        t.Last_Error_Code__c = RETRY_BUDGET_EXHAUSTED;
+        t.Next_Retry_At__c = null;
+        clearInFlight(t);
         return new ApplyResult(true, null);
     }
 
