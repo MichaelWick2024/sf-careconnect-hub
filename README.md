@@ -50,7 +50,8 @@ Attorney Org  ◄── REST ──►  Care Connect (this repo)  ◄── REST
 | `AttorneyReferralRequestMapper` — `Referral__c`/`Contact` → request DTO | ✅ Implemented (PR #7) |
 | `AttorneyDispatchQueueable` / `AttorneySendQueueable` — serial chain, invokes #4–#7b | ✅ Implemented (PR #8) |
 | Recovery foundations — `Ready_For_Attorney__c`, `enqueueRoot`, `applyExhaustedRetryRepair` (#11), hourly backoff | ✅ Implemented (PR #9) |
-| Trigger (enqueue on eligible referrals) · hourly retry & stale-recovery sweep | ⏳ Planned |
+| `ReferralTrigger` / `ReferralTriggerHandler` — starts the chain on eligibility | ✅ Implemented |
+| Hourly retry & stale-recovery sweep · live auth config | ⏳ Planned |
 
 ## Documentation
 
