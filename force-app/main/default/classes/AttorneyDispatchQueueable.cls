@@ -22,7 +22,7 @@ public with sharing class AttorneyDispatchQueueable implements Queueable {
     // A single root drains at most MAX_ROOT_CANDIDATES referrals, worst-case 2 * ceil(N / MAX_CLAIM_BATCH)
     // chain links (a dispatcher + a sender per batch). MAX_CHAIN_DEPTH must cover that; the relationship
     // is pinned by AttorneyDispatchQueueableTest and 140 is verified accepted by the org.
-    @TestVisible private static final Integer MAX_ROOT_CANDIDATES = 200;
+    public static final Integer MAX_ROOT_CANDIDATES = 200; // referenced by the recovery sweep's query bound
     @TestVisible private static final Integer MAX_CHAIN_DEPTH = 140;
 
     private final List<Id> candidateIds;

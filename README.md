@@ -51,7 +51,8 @@ Attorney Org  ◄── REST ──►  Care Connect (this repo)  ◄── REST
 | `AttorneyDispatchQueueable` / `AttorneySendQueueable` — serial chain, invokes #4–#7b | ✅ Implemented (PR #8) |
 | Recovery foundations — `Ready_For_Attorney__c`, `enqueueRoot`, `applyExhaustedRetryRepair` (#11), hourly backoff | ✅ Implemented (PR #9) |
 | `ReferralTrigger` / `ReferralTriggerHandler` — starts the chain on eligibility | ✅ Implemented |
-| Hourly retry & stale-recovery sweep · live auth config | ⏳ Planned |
+| `AttorneyRecoverySweep` — scheduled retry & stale-recovery (#8 / #11) | ✅ Implemented |
+| Schedule the sweep · live auth config · real sandbox end-to-end test | ⏳ Planned |
 
 ## Documentation
 
