@@ -2,7 +2,7 @@
 
 > **Purpose** Define one durable record representing one logical transmission from Care Connect to another system, and the exact rules for moving it between states.
 > **Audience** Salesforce developers building or maintaining Care Connect outbound.
-> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, `AttorneyReferralRequestMapper`, and `AttorneyTransmissionService` (create/claim **#1–#3** plus the **#4–#8b outcome-application methods** `applySendOutcome`/`applyExternalConflict`/`applyStaleRecovery`) — exists (see Build status below). All transition *logic* is a synchronous, unit-tested layer (including #11 exhausted-retry repair), and the **serial Queueable chain** (`AttorneyDispatchQueueable` → `AttorneySendQueueable`) invokes the send transitions #4–#7b end to end, with the post-callout `FOR UPDATE` re-lock and token-gated application. The shared root-enqueue (`AttorneyDispatchQueueable.enqueueRoot`, `MaximumQueueableStackDepth`) and the `Referral__c.Ready_For_Attorney__c` eligibility signal exist. The **trigger (enqueues the first root on eligible referrals) and the scheduled recovery sweep (#8 / #11) are not built yet** and remain gated on this specification.
+> **Status** Object metadata deployed. The supporting Apex — `Uuid`, the request/response DTOs, both validators, `AttorneyApiService`, `AttorneyReferralRequestMapper`, and `AttorneyTransmissionService` (create/claim **#1–#3** plus the **#4–#8b outcome-application methods** `applySendOutcome`/`applyExternalConflict`/`applyStaleRecovery`) — exists (see Build status below). All transition *logic* is a synchronous, unit-tested layer (including #11 exhausted-retry repair), and the **serial Queueable chain** (`AttorneyDispatchQueueable` → `AttorneySendQueueable`) invokes the send transitions #4–#7b end to end, with the post-callout `FOR UPDATE` re-lock and token-gated application. The shared root-enqueue (`AttorneyDispatchQueueable.enqueueRoot`, `MaximumQueueableStackDepth`), the `Referral__c.Ready_For_Attorney__c` eligibility signal, and the **`ReferralTrigger` / `ReferralTriggerHandler`** (create-or-get on insert-ready or a false→true change, one root per transaction via a transaction-static guard) exist. The **scheduled recovery sweep (#8 / #11) is not built yet** and remains gated on this specification.
 > **Last verified against** `Integration_Transmission__c` deployed to the `careconnect` org — **17/17 fields**, 7 identity fields confirmed `required` by `describe` **and** by a live insert returning `REQUIRED_FIELD_MISSING`; defaults (`Status=Pending`, `Retry_Count=0`) proven by live insert; picklist API-name behaviour proven by live insert. Layout: 18/18 fields `Readonly`.
 > **Owner** Care Connect integration team.
 > **Related** `force-app/main/default/objects/Integration_Transmission__c/`, `permissionsets/Integration_Transmission_Support` (read-only), `permissionsets/Integration_Transmission_Runtime` (execution path). `Integration_Admin` deliberately does **not** cover this object.
@@ -701,15 +701,14 @@ and the platform injects auth. Tests use `HttpCalloutMock` and need none of this
 - ✅ `AttorneyTransmissionService` — **transitions #1–#3** (create-or-get + `FOR UPDATE` claim) + tests — merged (PR #6)
 - ✅ `AttorneyTransmissionService` — **#4–#8b outcome application** (`applySendOutcome` #4–#7, `applyExternalConflict` #7b, `applyStaleRecovery` #8a/#8b) + backoff, and `AttorneyReferralRequestMapper` (`Referral__c`/`Contact` → request DTO) + tests — merged (PR #7)
 - ✅ the serial Queueable chain — `AttorneyDispatchQueueable` (loops singular claim over `MAX_CLAIM_BATCH = 3`, enqueues one sender, carries leftover) → `AttorneySendQueueable` (all callouts first, post-callout `FOR UPDATE` re-lock, token-gated `applySendOutcome` #4–#7b, one `Integration_Log__c` per attempt, enqueues one next dispatcher) + `AttorneyApiService.TIMEOUT_MS = 30 s` + tests — merged (PR #8)
-- ✅ recovery foundations — `Referral__c.Ready_For_Attorney__c` eligibility signal; `AttorneyDispatchQueueable.enqueueRoot` (dedup + cap `MAX_ROOT_CANDIDATES = 200` + `MaximumQueueableStackDepth = MAX_CHAIN_DEPTH = 140`); `AttorneyTransmissionService.applyExhaustedRetryRepair` (#11); backoff sized to the hourly sweep (`BASE = 60 min`, cap 240) + tests — in-flight (PR #9)
+- ✅ recovery foundations — `Referral__c.Ready_For_Attorney__c` eligibility signal; `AttorneyDispatchQueueable.enqueueRoot` (dedup + cap `MAX_ROOT_CANDIDATES = 200` + `MaximumQueueableStackDepth = MAX_CHAIN_DEPTH = 140`); `AttorneyTransmissionService.applyExhaustedRetryRepair` (#11); backoff sized to the hourly sweep (`BASE = 60 min`, cap 240) + tests — merged (PR #9)
+- ✅ `ReferralTrigger` / `ReferralTriggerHandler` — starts the chain on eligibility (insert-with-`Ready_For_Attorney__c = true`, or a false→true change; never on other updates to an already-ready referral), create-or-get per qualifying referral every firing, at most ONE root via `enqueueRoot` guarded by a transaction-level static, bulk-safe + tests — in-flight
 
 **Still to build — this document is the contract for it:**
 
-- ⏳ the trigger + handler eligibility (creates transmissions for newly-`Ready_For_Attorney__c` referrals
-  every firing; enqueues at most ONE root via `enqueueRoot`, guarded by a transaction-level static) ·
-  the scheduled hourly recovery sweep (re-locks and invokes `applyStaleRecovery` #8 / `applyExhaustedRetryRepair`
-  #11, then `enqueueRoot`) · the live Named Credential / Connected App config (see *Live authentication
-  configuration* above)
+- ⏳ the scheduled hourly recovery sweep (Attorney-scoped query; singular re-lock; `applyStaleRecovery` #8 /
+  `applyExhaustedRetryRepair` #11; `enqueueRoot`; no synthesized attempt logs) · the live Named Credential /
+  Connected App config (see *Live authentication configuration* above)
 - ⏳ transition **#9 — manual retry** (`Failed` → `Retry Scheduled`, `Retry_Count = 0`) is specified but
   **deferred to a later hardening phase**: it needs a controlled admin action/service, not an ad-hoc edit.
   **`Ready_For_Attorney__c` is NOT the retry mechanism** — it is the one-time *initial* eligibility event;
@@ -718,9 +717,8 @@ and the platform injects auth. Tests use `HttpCalloutMock` and need none of this
   exists. Manual retry is a deliberate, separate control.
 
 Every transition #1–#8b and #11 is executable and unit-tested (`AttorneyTransmissionService`), the send
-chain drives #4–#7b end to end, and the shared root-enqueue + eligibility signal exist. What remains is
-the trigger that starts the chain on eligible referrals and the scheduled sweep that drives retries and
-stale recovery.
+chain drives #4–#7b end to end, and the trigger starts the chain on eligible referrals. What remains is
+the scheduled sweep that drives retries and stale recovery, and the live authentication config.
 
 ## Tests this specification demands
 
